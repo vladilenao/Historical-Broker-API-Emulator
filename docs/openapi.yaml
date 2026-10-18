@@ -1,0 +1,2765 @@
+openapi: 3.0.3
+info:
+  title: Historical Broker API Emulator
+  version: "0.1.0"
+  description: |
+    Целевой контракт исторических рыночных данных. Главный ресурс — инструмент,
+    публичный ключ — instrument_type + ticker. Свечи и покрытие подчинены ему;
+    downloads представляет процесс получения данных одного или многих инструментов.
+
+    Публичная форма чтения реализована по типу и тикеру. Переход клиента робота
+    остаётся отдельной согласованной миграцией.
+    Замечания к действующему контракту — docs/implemented-api-contract-audit.md.
+
+    ## Общие правила
+
+    * **Время — наивный UTC.** Все `datetime`, включая `from`/`to` и `*_candle_date`,
+      сериализуются как `YYYY-MM-DD HH:MM:SS` без таймзоны. Значения со смещением
+      (`Z`, `±hh:mm`) конвертируются в UTC. Исключения — моменты карточки
+      фьючерса `expiration_date`, `first_trade_date` и `last_trade_date`:
+      ISO 8601 со смещением `+00:00`.
+    * **Строки свечей** повторяют поля и порядок робота:
+      `datetime, open, high, low, close, volume`.
+    * **Границы `from`/`to` включительны** (`[from, to]`).
+    * **Интервалы:** `1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w, 1M`.
+    * **Типы инструментов:** `share, future, etf, currency`.
+    * **Публичная идентификация:** тип и тикер во всех целевых запросах и ответах.
+       UID/FIGI разрешает сервис; они не являются клиентскими параметрами.
+       Действующая диагностика market-import мигрирует отдельно.
+    * **Совместимость My_roBot:** маршруты совместимости по UID сохранены и строго
+      соответствуют используемому контракту Tinkoff API. Их путь, параметры,
+      тела запросов и форма ответов менять нельзя; новые возможности добавляются
+      только в type+ticker API.
+      `GET /api/v1/instruments` без `api_version=2` возвращает прежний массив;
+      новая объектная форма каталога требует `api_version=2`. Остальные новые
+      операции type+ticker не требуют параметра версии.
+    * **Формат ошибки** единый:
+      `{"error": {"code": "...", "message": "..."}}`. HTTP-код 422 не используется;
+      ошибки валидации отдаются как 400 с кодом `VALIDATION_ERROR`.
+    * **Чтение (`candles`, `coverage`, `instruments`) офлайн** и не обращается к
+      Tinkoff. **Создание, предпросмотр и повтор загрузки требуют настроенного
+      доступа к Tinkoff**; без него — 401 `AUTHENTICATION_ERROR`.
+      Журнал, результаты и отмена не требуют обращения к поставщику.
+    * **Продолжение страниц** — по `_links.next`; клиент не вычисляет курсоры.
+      Снимок чтения — непрозрачная строка snapshot, а не номер генерации БД.
+    * **RMM ≥ 3:** ресурсы instruments и downloads отдают гипермедиа `_links`.
+      Формат ссылок — вложенный JSON в `application/json` (не строгий HAL).
+    * **Статус реализации:** каждая операция помечена vendor-расширением
+       `x-status: implemented` (операция доступна в коде) или `x-status: planned`
+        (операция проектируется).
+
+    ## Проектные документы
+
+    Логика выбора контрактов, инкрементальной догрузки и модель данных описаны в
+    `docs/futures-backfill-service-design.md`.
+servers:
+  - url: http://127.0.0.1:8100
+    description: Локальный эмулятор (значение по умолчанию)
+tags:
+  - name: health
+    description: Проверка живости сервиса.
+  - name: instruments
+    description: Главный ресурс — инструмент по типу и тикеру; карточка, свечи, покрытие и батчевое чтение. Read-only.
+  - name: downloads
+    description: Загрузка свечей акций и фьючерсов по тикеру, а также серий фьючерсов по базовому активу; отчёт о результате. Требует токен для создания загрузки.
+  - name: market-import
+    description: Состояние импорта изменений My Robot и внеочередная синхронизация.
+  - name: root
+    description: Корневой ресурс со ссылками на коллекции.
+  - name: tinkoff-compatibility
+    description: Неизменяемые UID-маршруты, совместимые с используемым Tinkoff API.
+  - name: data-quality
+    description: Офлайн-отчёт качества истории на снимке; паузы не являются доказанными потерями данных.
+
+paths:
+  /api/v1/history/data-quality/report:
+    post:
+      tags: [data-quality]
+      operationId: historyDataQualityReport
+      x-status: implemented
+      summary: Отчёт качества истории на снимке
+      description: |
+        Отдельный офлайн SQL-анализ истории по типу и тикеру. Возвращает границы,
+        количество свечей, достаточность закрытого прогрева, дефекты OHLC,
+        объёма и временных меток, а также наблюдаемые паузы между свечами.
+        Не загружает историю у брокера, не возвращает OHLCV и не изменяет /coverage.
+
+        Границы from/to включительны. Дата без времени в to означает конец дня.
+        Каждый таймфрейм проверяется независимо. Месячный интервал учитывается
+        календарно. Отрицательная цена сама по себе не является дефектом.
+
+        Паузы — наблюдения, а не подтверждённые потери торговых свечей.
+        Без календаря и подтверждения причин отсутствия свечей completeness
+        всегда unknown. Статус ready не выдаётся: not_ready означает отсутствие
+        данных, дефекты, недостаточный прогрев или ошибку пары; warning —
+        наблюдаемые паузы или неподтверждённые края; unknown — отсутствие
+        обнаруженных проблем при неподтверждённой полноте.
+
+        Один snapshot фиксирует каталог и версии свечей для всего батча.
+        Без snapshot создаётся новый; вернувшийся токен нужно передать в
+        последующее публичное чтение. Снимки недействительны после перезапуска.
+
+        Счётчики охватывают весь диапазон; примеры ограничены sample_limit,
+        паузы сортируются от наиболее длинных. При HTTP 200 проверяйте status
+        и issues каждой пары. Ошибка отдельного диапазона, отсутствующий или
+        неоднозначный инструмент не мешают получить остальные результаты.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QualityReportRequest"
+            examples:
+              single:
+                summary: Проверить часовые свечи и два бара прогрева
+                value:
+                  requests:
+                    - instrument_type: share
+                      ticker: SBER
+                      interval: 1h
+                      from: "2025-01-15T10:00:00Z"
+                      to: "2025-01-15T18:59:59Z"
+                      warmup_bars: 2
+                  sample_limit: 20
+              batch:
+                summary: Несколько таймфреймов на ранее полученном снимке
+                value:
+                  snapshot: rs_example
+                  requests:
+                    - {instrument_type: share, ticker: SBER, interval: 1m, from: "2025-01-01", to: "2025-12-21", warmup_bars: 1}
+                    - {instrument_type: share, ticker: SBER, interval: 1h, from: "2025-01-01", to: "2025-12-21", warmup_bars: 50}
+                  sample_limit: 10
+      responses:
+        "200":
+          description: Отчёт построен; статус и проблемы находятся в результатах.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QualityReportResponse"
+              example:
+                report_version: 1
+                snapshot: rs_example
+                status: warning
+                count: 1
+                results:
+                  - instrument_type: share
+                    ticker: SBER
+                    interval: 1h
+                    requested_from: "2025-01-15 10:00:00"
+                    requested_to: "2025-01-15 18:59:59"
+                    status: warning
+                    completeness: unknown
+                    first: "2025-01-15 10:00:00"
+                    last: "2025-01-15 18:00:00"
+                    count: 8
+                    warmup: {required: 2, available: 2, invalid_count: 0, satisfied: true}
+                    invalid_count: 0
+                    invalid_samples: []
+                    invalid_samples_truncated: false
+                    pause_count: 1
+                    longest_pause_seconds: 3600
+                    pauses:
+                      - {previous: "2025-01-15 12:00:00", following: "2025-01-15 14:00:00", pause_from: "2025-01-15 13:00:00", duration_seconds: 3600}
+                    pauses_truncated: false
+                    issues:
+                      - {code: COMPLETENESS_UNKNOWN, message: "Полнота не подтверждена без календаря и причин отсутствия свечей.", count: null}
+                      - {code: OBSERVED_PAUSES, message: "Пауза может быть торговым перерывом или отсутствием сделок.", count: 1}
+        "400":
+          description: Некорректное тело (VALIDATION_ERROR) или неизвестный snapshot (INVALID_SNAPSHOT).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Внутренняя ошибка; не выдаётся как положительный результат проверки.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /health:
+    get:
+      tags: [health]
+      summary: Проверка здоровья
+      description: Фиксированный ответ, что сервис работает.
+      operationId: getHealth
+      x-status: implemented
+      responses:
+        "200":
+          description: Сервис работает.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+              example: {status: ok}
+
+  /api/v1/:
+    get:
+      tags: [root]
+      summary: Корневой ресурс
+      description: |
+        Точка входа с гипермедиа-ссылками на коллекции (RMM ≥ 3). Клиент не
+        собирает адреса вручную, а идёт по `_links`.
+      operationId: getRoot
+      x-status: implemented
+      responses:
+        "200":
+          description: Ссылки на ресурсы.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LinksDocument"
+              example:
+                _links:
+                  self: {href: /api/v1/}
+                  instruments: {href: "/api/v1/instruments?api_version=2"}
+                  candles_batch: {href: /api/v1/instruments/candles/batch, method: POST}
+                  selection: {href: /api/v1/history/downloads/selection, method: POST}
+                  downloads: {href: /api/v1/history/downloads}
+                  data_quality: {href: /api/v1/history/data-quality/report, method: POST}
+
+  /api/v1/instruments/{instrument_type}/{ticker}/candles:
+    get:
+      tags: [instruments]
+      summary: Свечи инструмента по типу и тикеру
+      description: |
+        Сохранённые свечи инструмента в диапазоне [from, to], по возрастанию
+        datetime. Тип и тикер разрешает сервис; UID/FIGI клиент не передаёт.
+        Неизвестный инструмент — 404, неоднозначная пара — 409. Пустой список
+        означает отсутствие сохранённых свечей для уже найденного инструмента.
+        Read-only, без скачивания из Tinkoff.
+
+        Для продолжения используется _links.next, которая сохраняет параметры
+        и снимок чтения. next_cursor непрозрачен; клиент его не разбирает.
+        snapshot фиксирует данные и соответствие тикеров инструментам на весь
+        просмотр; без параметра сервер создаёт снимок и возвращает его в ответе.
+        Этот же snapshot можно передавать в чтении других инструментов и покрытия.
+        total заполняется при хотя бы одной границе, иначе null.
+
+        Дата без времени в from — начало дня UTC, в to — конец дня (23:59:59).
+        После нормализации from должен быть раньше to. Точность — целые секунды.
+      operationId: getInstrumentCandles
+      x-status: implemented
+      parameters:
+        - $ref: "#/components/parameters/InstrumentTypePath"
+        - $ref: "#/components/parameters/TickerPath"
+        - name: interval
+          in: query
+          required: true
+          description: Интервал свечей.
+          schema:
+            $ref: "#/components/schemas/Interval"
+          example: 1h
+        - name: from
+          in: query
+          required: false
+          description: |
+            Начальная граница включительно; дата без времени — начало дня UTC.
+          schema:
+            $ref: "#/components/schemas/ReadTimeBound"
+          example: "2024-01-01T00:00:00"
+        - name: to
+          in: query
+          required: false
+          description: Конечная граница включительно; дата без времени включает весь день UTC.
+          schema:
+            $ref: "#/components/schemas/ReadTimeBound"
+          example: "2024-12-31T23:59:00"
+        - name: limit
+          in: query
+          required: false
+          description: Число свечей в ответе. От 1 до 200000.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200000
+            default: 20000
+        - name: cursor
+          in: query
+          required: false
+          description: Непрозрачное продолжение страницы; предпочтительно следовать _links.next.
+          schema:
+            type: string
+            nullable: true
+          example: opaque-candles-token
+        - $ref: "#/components/parameters/ReadSnapshot"
+      responses:
+        "200":
+          description: Свечи найдены (возможно, пустой список).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CandlesResponse"
+              example:
+                instrument_type: share
+                ticker: SBER
+                interval: 1h
+                range: {from: "2024-01-01 00:00:00", to: "2024-01-01 02:00:00"}
+                snapshot: opaque-read-snapshot
+                count: 2
+                total: 2
+                next_cursor: null
+                candles:
+                  - {datetime: "2024-01-01 00:00:00", open: 100.0, high: 101.0, low: 99.0, close: 100.5, volume: 1000}
+                  - {datetime: "2024-01-01 01:00:00", open: 100.5, high: 102.0, low: 100.0, close: 101.0, volume: 2000}
+                _links:
+                  self: {href: "/api/v1/instruments/share/SBER/candles?interval=1h&from=2024-01-01&to=2024-01-01T02:00:00&snapshot=opaque-read-snapshot"}
+                  instrument: {href: "/api/v1/instruments/share/SBER?snapshot=opaque-read-snapshot"}
+        "400":
+          $ref: "#/components/responses/InstrumentReadBadRequest"
+        "404":
+          $ref: "#/components/responses/InstrumentReadNotFound"
+        "409":
+          $ref: "#/components/responses/InstrumentReadAmbiguous"
+        "503":
+          $ref: "#/components/responses/InstrumentReadMetadataPending"
+  /api/v1/instruments/candles/batch:
+    post:
+      tags: [instruments]
+      summary: Свечи нескольких инструментов по типам и тикерам
+      description: |
+        Свечи сразу для списка инструментов и интервалов. Каждый подзапрос содержит
+        instrument_type и ticker. Все результаты читаются из одного снимка;
+        snapshot передаётся на уровне батча или создаётся сервером.
+
+        Результаты лежат в `results` **строго в порядке `requests`**, сопоставление —
+        по индексу. Ошибка одного подзапроса не отменяет остальные: она в поле
+        `error` этого элемента, а HTTP-статус остаётся 200. Ошибки всего запроса —
+        неверная структура тела, превышение лимита подзапросов или непригодный
+        общий snapshot (400). Неверный интервал, тип, строка даты, период,
+        неизвестный/неоднозначный тикер и ошибка продолжения обрабатываются
+        поэлементно. Для продолжения каждого результата используется его _links.next.
+      operationId: postCandlesBatch
+      x-status: implemented
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CandleBatchRequest"
+            example:
+              requests:
+                - {instrument_type: share, ticker: SBER, interval: 1m, from: "2024-01-01T00:00:00", to: "2024-01-02T00:00:00"}
+                - {instrument_type: future, ticker: NG-1.26, interval: 1d, from: "2025-11-01", to: "2025-12-31"}
+      responses:
+        "200":
+          description: Результат по каждому подзапросу, в порядке запроса.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CandleBatchResponse"
+              example:
+                count: 2
+                snapshot: opaque-read-snapshot
+                results:
+                  - instrument_type: share
+                    ticker: SBER
+                    interval: 1m
+                    range: {from: "2024-01-01 00:00:00", to: "2024-01-01 01:00:00"}
+                    count: 1
+                    total: 1
+                    next_cursor: null
+                    candles:
+                      - {datetime: "2024-01-01 00:00:00", open: 100.0, high: 101.0, low: 99.0, close: 100.5, volume: 1000}
+                    error: null
+                    _links: {instrument: {href: "/api/v1/instruments/share/SBER?snapshot=opaque-read-snapshot"}}
+                  - instrument_type: future
+                    ticker: NG-1.26
+                    interval: 2h
+                    range: null
+                    count: 0
+                    total: null
+                    next_cursor: null
+                    candles: []
+                    error:
+                      code: INVALID_INTERVAL
+                      message: "Неподдерживаемый таймфрейм '2h'."
+                    _links: {}
+        "400":
+          description: Некорректное тело запроса или превышен лимит подзапросов (256).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: {code: VALIDATION_ERROR, message: Проверка запроса не пройдена.}
+
+  /api/v1/instruments/{instrument_type}/{ticker}/coverage:
+    get:
+      tags: [instruments]
+      summary: Доступность сохранённой истории инструмента
+      description: |
+        Статистика и проверка доступной сохранённой истории без выгрузки свечей.
+        requested_range — нормализованные границы запроса; available_range —
+        крайние имеющиеся свечи внутри диапазона, либо null при count=0.
+        status=complete допустим только при подтверждённой полноте; крайние свечи
+        и количество сами по себе не являются доказательством. Иначе unknown,
+        partial или missing с понятной причиной. slots и внутренние генерации
+        не публикуются. Информационный ресурс не управляет алгоритмом загрузки.
+        Поддерживает тот же snapshot и семантику дат, что чтение свечей. Read-only.
+      operationId: getInstrumentCoverage
+      x-status: implemented
+      parameters:
+        - $ref: "#/components/parameters/InstrumentTypePath"
+        - $ref: "#/components/parameters/TickerPath"
+        - name: interval
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/Interval"
+          example: 5m
+        - name: from
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/ReadTimeBound"
+          example: "2023-01-01T00:00:00"
+        - name: to
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/ReadTimeBound"
+          example: "2025-01-01T00:00:00"
+        - $ref: "#/components/parameters/ReadSnapshot"
+      responses:
+        "200":
+          description: "Покрытие определено (возможно, `count: 0`)."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CoverageResponse"
+              example:
+                instrument_type: share
+                ticker: SBER
+                interval: 5m
+                requested_range: {from: "2023-01-01 00:00:00", to: "2025-01-01 00:00:00"}
+                available_range: {from: "2023-01-02 09:35:00", to: "2024-12-31 18:50:00"}
+                count: 208431
+                status: unknown
+                snapshot: opaque-read-snapshot
+                reason: {code: COVERAGE_NOT_CONFIRMED, message: Полнота истории пока не подтверждена.}
+                _links:
+                  self: {href: "/api/v1/instruments/share/SBER/coverage?interval=5m&from=2023-01-01&to=2025-01-01T00:00:00&snapshot=opaque-read-snapshot"}
+                  candles: {href: "/api/v1/instruments/share/SBER/candles?interval=5m&from=2023-01-01&to=2025-01-01T00:00:00&snapshot=opaque-read-snapshot"}
+        "400":
+          $ref: "#/components/responses/InstrumentReadBadRequest"
+        "404":
+          $ref: "#/components/responses/InstrumentReadNotFound"
+        "409":
+          $ref: "#/components/responses/InstrumentReadAmbiguous"
+        "503":
+          $ref: "#/components/responses/InstrumentReadMetadataPending"
+
+  /api/v1/instruments:
+    get:
+      tags: [instruments]
+      summary: Поиск сохранённых инструментов
+      description: |
+        Общий каталог с фильтрами ticker и instrument_type. Без `api_version=2`
+        возвращается UID-представление, совместимое с Tinkoff API. С `api_version=2`
+        UID и FIGI не являются публичными идентификаторами. Сервис обеспечивает однозначную карточку
+        для каждой пары типа и тикера; конфликт не скрывается случайным выбором.
+        Только сохранённые метаданные, без обращения к Tinkoff.
+
+        Представление версии 2 — объект с instruments, count, total, snapshot и _links.
+        total учитывает все фильтры. Листание — по _links.next без offset и
+        вычисления курсоров. Снимок фиксирует состав каталога и соответствие
+        публичных тикеров внутренним инструментам.
+      operationId: findInstruments
+      x-status: implemented
+      parameters:
+        - name: ticker
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/PublicTicker"
+          example: SBER
+        - name: api_version
+          in: query
+          required: false
+          description: |
+            `2` выбирает объект InstrumentList этого контракта. При отсутствии
+            параметра возвращается Tinkoff-совместимый UID-массив для My_roBot.
+          schema: {type: integer, enum: [2]}
+        - name: instrument_type
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/InstrumentType"
+          example: future
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 5000, default: 5000}
+        - name: cursor
+          in: query
+          required: false
+          description: Непрозрачное продолжение из предыдущего ответа; используйте _links.next.
+          schema: {type: string}
+        - $ref: "#/components/parameters/ReadSnapshot"
+      responses:
+        "200":
+          description: Подходящие инструменты (возможно, пустой список).
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/InstrumentList"
+                  - type: array
+                    items:
+                      $ref: "#/components/schemas/TinkoffInstrument"
+              example:
+                count: 1
+                total: 2
+                snapshot: opaque-read-snapshot
+                next_cursor: opaque-instruments-token
+                instruments:
+                  - ticker: SBER
+                    instrument_type: share
+                    name: Сбербанк
+                    currency: RUB
+                    lot: 10
+                    min_price_increment: 0.01
+                    expiration_date: null
+                    basic_asset: null
+                    basic_asset_size: null
+                    first_trade_date: null
+                    last_trade_date: null
+                    _links:
+                      self: {href: "/api/v1/instruments/share/SBER?snapshot=opaque-read-snapshot"}
+                      candles: {href: "/api/v1/instruments/share/SBER/candles?interval=1d&snapshot=opaque-read-snapshot"}
+                      coverage: {href: "/api/v1/instruments/share/SBER/coverage?interval=1d&snapshot=opaque-read-snapshot"}
+                _links:
+                  self: {href: "/api/v1/instruments?api_version=2&instrument_type=share&limit=1&snapshot=opaque-read-snapshot"}
+                  next: {href: "/api/v1/instruments?api_version=2&instrument_type=share&limit=1&snapshot=opaque-read-snapshot&cursor=opaque-instruments-token"}
+        "400":
+          $ref: "#/components/responses/InstrumentReadBadRequest"
+        "409":
+          $ref: "#/components/responses/InstrumentReadAmbiguous"
+
+  /api/v1/candles:
+    get:
+      tags: [tinkoff-compatibility]
+      summary: Tinkoff-compatible UID candles
+      description: |
+        Tinkoff-compatible route for the current My_roBot. This endpoint
+        strictly matches the Tinkoff API contract: its path, query parameters and
+        response shape must not change. Use the nested instrument candles resource
+        for new clients.
+      operationId: getLegacyCandles
+      x-status: implemented
+      responses:
+        "200":
+          description: Legacy paged candle response.
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {description: Invalid Tinkoff-compatible request.}
+
+  /api/v1/candles/batch:
+    post:
+      tags: [tinkoff-compatibility]
+      summary: Tinkoff-compatible UID candle batch
+      description: |
+        Tinkoff-compatible route for the current My_roBot. This endpoint
+        strictly matches the Tinkoff API contract: its path, request body and
+        response shape must not change. Use the instrument batch resource for new
+        clients.
+      operationId: postLegacyCandlesBatch
+      x-status: implemented
+      responses:
+        "200":
+          description: Legacy batch candle response.
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {description: Invalid Tinkoff-compatible request.}
+
+  /api/v1/coverage:
+    get:
+      tags: [tinkoff-compatibility]
+      summary: Tinkoff-compatible UID coverage
+      description: |
+        Tinkoff-compatible route for the current My_roBot. This endpoint
+        strictly matches the Tinkoff API contract: its path, query parameters and
+        response shape must not change. Use nested instrument coverage for new
+        clients.
+      operationId: getLegacyCoverage
+      x-status: implemented
+      responses:
+        "200":
+          description: Legacy coverage response.
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {description: Invalid Tinkoff-compatible request.}
+
+  /api/v1/trading-schedules:
+    get:
+      tags: [tinkoff-compatibility]
+      summary: Расписание торгов инструмента на снимке
+      description: |
+        UID-маршрут, который уже вызывает исторический режим My_roBot
+        (`EmulatorScheduleSource`). Это исключение из правила «новое — только в
+        type+ticker API»: форма ответа задана действующим клиентом робота.
+
+        Источники — лента `trading-schedules` экспорта My Robot и дни,
+        восстановленные эмулятором по правилам сессий (CLI
+        `reconstruct-schedules`) для прошедших дат, которых брокер не отдаёт.
+        Для каждой торговой даты (МСК) между `from` и `to` включительно
+        отдаётся последняя видимая в снимке версия дня из ленты, а если её нет —
+        восстановленная (`provenance: reconstructed`, `rules_version`,
+        `source: emulator-reconstructed`). Режим торгов определяется по привязке
+        UID с тем же приоритетом (`binding_provenance`). В `missing_dates` —
+        только даты без того и другого.
+
+        `version` — sha256 канонического JSON исходного TradingDay, `day` — сам
+        TradingDay без изменений: робот пересчитывает версию и сверяет её.
+        С `snapshot_generation` ответ закреплён за снимком из
+        `POST /api/v1/market-import/sync` и возвращает тот же номер; без
+        параметра используется текущее поколение.
+      operationId: getLegacyTradingSchedules
+      x-status: implemented
+      parameters:
+        - name: instrument_id
+          in: query
+          required: true
+          schema: {type: string, minLength: 1}
+          description: UID инструмента.
+        - name: from
+          in: query
+          required: true
+          schema: {type: string}
+          description: Начало диапазона, UTC (`YYYY-MM-DD HH:MM:SS`, ISO 8601 или дата). Переводится в торговую дату МСК.
+        - name: to
+          in: query
+          required: true
+          schema: {type: string}
+          description: Конец диапазона включительно, UTC. Диапазон — не длиннее 366 торговых дат.
+        - name: snapshot_generation
+          in: query
+          required: false
+          schema: {type: integer, minimum: 0}
+          description: Номер снимка из POST /api/v1/market-import/sync; не больше текущего.
+      responses:
+        "200":
+          description: Дни расписания и даты без расписания. Без привязки UID `exchange` равен null, а `days` пуст.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TradingScheduleResponse"
+              example:
+                instrument_id: uid-sber
+                exchange: moex_mrng_evng_e_wknd_dlr
+                binding_provenance: my_robot_export
+                from: "2026-10-08"
+                to: "2026-10-10"
+                snapshot_generation: 42
+                days:
+                  - trading_date: "2026-10-09"
+                    exchange: moex_mrng_evng_e_wknd_dlr
+                    version: 644baa41f9ef0c6c1b1f5e8d3a7a2b9c4d0e1f2a3b4c5d6e7f8091a2b3c4d5e6
+                    is_trading_day: true
+                    source: tbank
+                    provenance: my_robot_export
+                    rules_version: null
+                    observed_at: "2026-10-09T05:00:00.000000Z"
+                    last_confirmed_at: "2026-10-09T05:00:00.000000Z"
+                    day:
+                      date: "2026-10-09T00:00:00.000000Z"
+                      is_trading_day: true
+                      start_time: "2026-10-09T06:50:00.000000Z"
+                      end_time: "2026-10-09T20:50:00.000000Z"
+                      intervals: []
+                missing_dates: ["2026-10-08", "2026-10-10"]
+        "400":
+          description: |
+            `INVALID_TIME_RANGE` — from позже to или диапазон длиннее 366 дней;
+            `INVALID_SNAPSHOT` — snapshot_generation больше текущего;
+            `VALIDATION_ERROR` — некорректные параметры.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "404":
+          description: "`INSTRUMENT_NOT_FOUND` — UID нет ни в каталоге, ни в привязках расписаний."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+
+  /api/v1/instruments/{instrument_id}:
+    get:
+      tags: [tinkoff-compatibility]
+      summary: Tinkoff-compatible UID instrument card
+      description: |
+        Tinkoff-compatible route for the current My_roBot. This endpoint
+        strictly matches the Tinkoff API contract: its path, path parameter and
+        response shape must not change. Use the type+ticker card for new clients.
+      operationId: getTinkoffInstrument
+      x-status: implemented
+      parameters:
+        - name: instrument_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Legacy instrument card.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TinkoffInstrument"
+        "404":
+          $ref: "#/components/responses/InstrumentReadNotFound"
+
+  /api/v1/instruments/{instrument_type}/{ticker}:
+    get:
+      tags: [instruments]
+      summary: Получить один инструмент
+      description: |
+        Карточка по типу и тикеру. Сервис разрешает внутренний UID, клиент его
+        не получает и не передаёт. Для фьючерса есть expiration_date и ГО;
+        для акции expiration_date — null. _links ведут к свечам и покрытию.
+        snapshot позволяет читать карточку из того же снимка, что свечи.
+      operationId: getInstrument
+      x-status: implemented
+      parameters:
+        - $ref: "#/components/parameters/InstrumentTypePath"
+        - $ref: "#/components/parameters/TickerPath"
+        - $ref: "#/components/parameters/ReadSnapshot"
+      responses:
+        "200":
+          description: Инструмент найден.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Instrument"
+              example:
+                instrument_type: future
+                ticker: NG-1.26
+                name: Фьючерс на природный газ
+                currency: RUB
+                lot: 1
+                min_price_increment: 0.001
+                min_price_increment_amount: 1.0
+                initial_margin_on_buy: 8500.0
+                initial_margin_on_sell: 8500.0
+                expiration_date: "2025-12-25T00:00:00+00:00"
+                basic_asset: "Газ (США)"
+                basic_asset_size: 10.0
+                first_trade_date: "2024-11-01T00:00:00+00:00"
+                last_trade_date: "2025-12-24T00:00:00+00:00"
+                snapshot: opaque-read-snapshot
+                _links:
+                  self: {href: "/api/v1/instruments/future/NG-1.26?snapshot=opaque-read-snapshot"}
+                  candles: {href: "/api/v1/instruments/future/NG-1.26/candles?interval=1d&snapshot=opaque-read-snapshot"}
+                  coverage: {href: "/api/v1/instruments/future/NG-1.26/coverage?interval=1d&snapshot=opaque-read-snapshot"}
+        "400":
+          $ref: "#/components/responses/InstrumentReadBadRequest"
+        "404":
+          $ref: "#/components/responses/InstrumentReadNotFound"
+        "409":
+          $ref: "#/components/responses/InstrumentReadAmbiguous"
+        "503":
+          $ref: "#/components/responses/InstrumentReadMetadataPending"
+
+  /api/v1/history/downloads/selection:
+    post:
+      tags: [downloads]
+      summary: Предпросмотр загрузки акции, фьючерса или серии
+      description: |
+        Принимает то же тело, что создание загрузки: target, range, intervals.
+        Возвращает полный план «инструмент × интервал»: фактическое окно,
+        доступность периода, имеющиеся данные и ожидаемый результат (загрузка,
+        пропуск либо недоступность). Исключённые инструменты перечислены с причиной.
+
+        Для акции окно — запрошенный период; для фьючерса — полная жизнь
+        контракта, пересекающего range. Нужные карточки получает сервис, включая
+        истёкшие фьючерсы. Свечи не скачиваются и ресурс загрузки не создаётся,
+        но метаданные могут обновляться. Требует TINKOFF_TOKEN.
+
+        coverage=complete означает подтверждённую доступность требуемых данных,
+        а не совпадение крайних свечей. При отсутствии доказательства возвращается
+        unknown и сервис планирует проверку. Отсутствие торгов не считается дырой,
+        если подтверждено календарём или источником. Доступность данных unknown
+        означает, что окончательный результат определится при загрузке.
+      operationId: previewDownloadSelection
+      x-status: implemented
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DownloadCreateRequest"
+            examples:
+              share:
+                value:
+                  target: {instrument_type: share, ticker: SBER}
+                  range: {from: "2025-01-01", to: "2025-12-31"}
+                  intervals: [1d, 1h]
+              series:
+                value:
+                  target: {instrument_type: future, base_asset: NG}
+                  range: {from: "2025-01-01", to: "2025-12-31"}
+                  intervals: [1d]
+      responses:
+        "200":
+          description: План выборки.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DownloadSelectionResponse"
+              examples:
+                share:
+                  value:
+                    target: {instrument_type: share, ticker: SBER}
+                    range: {from: "2025-01-01 00:00:00", to: "2025-12-31 23:59:59"}
+                    intervals: [1d]
+                    summary: {instruments: 1, items_total: 1, items_already_covered: 0, items_to_fetch: 1, items_unavailable: 0}
+                    items:
+                      - instrument_type: share
+                        ticker: SBER
+                        interval: 1d
+                        window: {from: "2025-01-01 00:00:00", to: "2025-12-31 23:59:59"}
+                        availability: {status: available, available_window: {from: "2025-01-01 00:00:00", to: "2025-12-31 23:59:59"}}
+                        coverage: {status: missing, count: 0}
+                        action: download
+                        _links: {instrument: {href: /api/v1/instruments/share/SBER}}
+                    excluded: []
+                    _links:
+                      self: {href: /api/v1/history/downloads/selection, method: POST}
+                      download: {href: /api/v1/history/downloads, method: POST}
+                future:
+                  value:
+                    target: {instrument_type: future, ticker: NG-1.26}
+                    range: {from: "2025-11-01 00:00:00", to: "2026-01-15 23:59:59"}
+                    intervals: [1d]
+                    summary: {instruments: 1, items_total: 1, items_already_covered: 1, items_to_fetch: 0, items_unavailable: 0}
+                    items:
+                      - instrument_type: future
+                        ticker: NG-1.26
+                        interval: 1d
+                        window: {from: "2025-11-05 00:00:00", to: "2025-12-23 18:45:00"}
+                        availability: {status: available, available_window: {from: "2025-11-05 00:00:00", to: "2025-12-23 18:45:00"}}
+                        coverage: {status: complete, count: 34}
+                        action: skip
+                        reason: {code: ALREADY_AVAILABLE, message: Требуемые данные уже доступны.}
+                    excluded: []
+                    _links:
+                      self: {href: /api/v1/history/downloads/selection, method: POST}
+                      download: {href: /api/v1/history/downloads, method: POST}
+        "400":
+          description: Некорректное тело запроса.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: {code: VALIDATION_ERROR, message: Проверка запроса не пройдена.}
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/DownloadTargetNotFound"
+        "409":
+          $ref: "#/components/responses/DownloadTargetConflict"
+        "502":
+          $ref: "#/components/responses/TinkoffUnavailable"
+        "503":
+          $ref: "#/components/responses/DownloadMetadataUnavailable"
+
+  /api/v1/history/downloads:
+    post:
+      tags: [downloads]
+      summary: Создать загрузку свечей акций или фьючерсов
+      description: |
+        Фасад: принимает бизнес-задачу и запускает её в фоне, отвечая сразу 202.
+
+        `target.instrument_type` обязателен: `share` — акция, `future` — фьючерс.
+        ticker задаёт один инструмент; base_asset задаёт серию
+        фьючерсов и допустим только для future. Ровно один способ выбора.
+
+        Для акции загружается запрошенный `range`. Для серии фьючерсов `range`
+        выбирает контракты по пересечению торгового окна; каждый выбранный
+        контракт загружается за полную жизнь. Один фьючерс по тикеру также
+        загружается за полную жизнь; его торговое окно должно пересекать `range`.
+        Фактические окна по интервалам доступны в результатах загрузки.
+
+        Сервис сам получает нужные метаданные, проверяет имеющиеся данные,
+        догружает отсутствующее и собирает отчёт. Предварительная ручная
+        синхронизация каталога не требуется. Клиент не задаёт внутренние политики.
+
+        До ответа проверяются структура, тип/цель, даты и доступность исполнителя.
+        Разрешение цели и получение данных выполняются в фоне. Неизвестная цель,
+        неоднозначный тикер или недоступный период после 202 отражаются в error
+        ресурса либо в ошибках пунктов; HTTP-ответ создания задним числом не меняется.
+        Если акция имеет лишь часть истории, доступная часть загружается, а
+        availability=partial с HISTORY_DEPTH_LIMIT отражает ограничение. Если
+        доступного периода нет, пункт failed с PERIOD_NOT_AVAILABLE. Периоды без
+        торгов не заполняются искусственными свечами; подтверждённое отсутствие
+        торгов может дать skipped с NO_TRADES/MARKET_CLOSED и нулевыми счётчиками.
+
+        Полнота подтверждается исполнением и сведениями поставщика о торгах,
+        а не только крайними свечами. Неопределённое покрытие проверяется сервисом.
+        Повторный POST не обновляет уже успешно загруженные данные и не возобновляет
+        отменённую загрузку; для failed/cancelled используется возвращённая retry-ссылка.
+
+        Повторный идентичный запрос идемпотентен и возвращает существующий ресурс
+        (200 вместо 202). `download_id` — непрозрачный идентификатор: вычислять его
+        на стороне клиента не нужно. Создание требует `TINKOFF_TOKEN`.
+      operationId: createDownload
+      x-status: implemented
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DownloadCreateRequest"
+            examples:
+              series:
+                summary: Серия по базовому активу
+                value:
+                  target: {instrument_type: future, base_asset: NG}
+                  range: {from: "2025-01-01", to: "2025-12-31"}
+                  intervals: [1d, 1h]
+              contract:
+                summary: Один контракт по тикеру
+                value:
+                  target: {instrument_type: future, ticker: NG-1.26}
+                  range: {from: "2025-11-01", to: "2026-01-15"}
+                  intervals: [1d]
+              share:
+                summary: Свечи акции SBER за запрошенный период
+                value:
+                  target: {instrument_type: share, ticker: SBER}
+                  range: {from: "2025-01-01", to: "2025-12-31"}
+                  intervals: [1d, 1h]
+      responses:
+        "202":
+          description: Загрузка принята; работа идёт в фоне.
+          headers:
+            Location:
+              description: URL созданного ресурса загрузки.
+              schema: {type: string}
+              example: /api/v1/history/downloads/dr_5f2c9a1b8e7d
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DownloadResource"
+              example:
+                download_id: dr_5f2c9a1b8e7d
+                target: {instrument_type: future, base_asset: NG}
+                range: {from: "2025-01-01 00:00:00", to: "2025-12-31 23:59:59"}
+                intervals: [1d, 1h]
+                status: pending
+                summary: {instruments: 13, items_total: 26, items_pending: 22, items_running: 0, items_completed: 0, items_skipped: 4, items_failed: 0, items_cancelled: 0}
+                attempt: 1
+                created_at: "2025-12-30 10:00:00"
+                started_at: null
+                finished_at: null
+                _links:
+                  self: {href: /api/v1/history/downloads/dr_5f2c9a1b8e7d}
+                  items: {href: /api/v1/history/downloads/dr_5f2c9a1b8e7d/items}
+                  report: {href: /api/v1/history/downloads/dr_5f2c9a1b8e7d/report}
+                  cancel: {href: /api/v1/history/downloads/dr_5f2c9a1b8e7d/cancel, method: POST}
+                  collection: {href: /api/v1/history/downloads}
+        "200":
+          description: Идентичная загрузка уже существует (идемпотентный повтор).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DownloadResource"
+        "400":
+          description: Некорректное тело запроса.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: {code: VALIDATION_ERROR, message: Проверка запроса не пройдена.}
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/DownloadServiceUnavailable"
+    get:
+      tags: [downloads]
+      summary: Журнал загрузок
+      description: |
+        Журнал загрузок с фильтрами, read-only, без обращения к Tinkoff.
+        Первая страница фиксирует состав выборки и порядок (свежие сверху).
+        Новые загрузки не добавляются в её продолжение; значения статусов могут
+        обновляться. Для нового состава клиент начинает листание заново.
+        Клиент следует _links.next; ссылка сохраняет все фильтры и limit.
+        next_cursor непрозрачен и не вычисляется из идентификаторов или времени.
+      operationId: listDownloads
+      x-status: implemented
+      parameters:
+        - name: instrument_type
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/DownloadInstrumentType"
+        - name: ticker
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/PublicTicker"
+          example: SBER
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/DownloadStatus"
+        - name: base_asset
+          in: query
+          required: false
+          schema: {type: string}
+          example: NG
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+        - name: cursor
+          in: query
+          required: false
+          description: Непрозрачное значение next_cursor; предпочтительно следовать готовой ссылке _links.next.
+          schema: {type: string, nullable: true}
+      responses:
+        "200":
+          description: Список загрузок.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DownloadResourceList"
+              example:
+                count: 1
+                total: 2
+                next_cursor: opaque-journal-token
+                downloads:
+                  - download_id: dr_sber_2025
+                    target: {instrument_type: share, ticker: SBER}
+                    range: {from: "2025-01-01 00:00:00", to: "2025-12-31 23:59:59"}
+                    intervals: [1d]
+                    status: completed
+                    summary: {instruments: 1, items_total: 1, items_pending: 0, items_running: 0, items_completed: 1, items_skipped: 0, items_failed: 0, items_cancelled: 0}
+                    attempt: 1
+                    created_at: "2026-01-01 10:00:00"
+                    started_at: "2026-01-01 10:00:01"
+                    finished_at: "2026-01-01 10:02:00"
+                    _links:
+                      self: {href: /api/v1/history/downloads/dr_sber_2025}
+                      items: {href: /api/v1/history/downloads/dr_sber_2025/items}
+                      report: {href: /api/v1/history/downloads/dr_sber_2025/report}
+                _links:
+                  self: {href: "/api/v1/history/downloads?instrument_type=share&limit=1"}
+                  next: {href: "/api/v1/history/downloads?instrument_type=share&limit=1&cursor=opaque-journal-token"}
+        "400":
+          $ref: "#/components/responses/DownloadPageInvalid"
+
+  /api/v1/history/downloads/{download_id}:
+    get:
+      tags: [downloads]
+      summary: Статус загрузки
+      description: |
+        Текущий статус, сводка по пунктам и допустимые действия в _links.
+        error описывает общий сбой до построения плана. Сбои отдельных пунктов
+        находятся в items/report. Не требует Tinkoff. При перезапуске сервиса
+        незавершённое исполнение восстанавливается с тем же download_id.
+      operationId: getDownload
+      x-status: implemented
+      parameters:
+        - name: download_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Ресурс загрузки.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DownloadResource"
+              example:
+                download_id: dr_5f2c9a1b8e7d
+                target: {instrument_type: future, base_asset: NG}
+                range: {from: "2025-01-01 00:00:00", to: "2025-12-31 23:59:59"}
+                intervals: [1d, 1h]
+                status: running
+                summary: {instruments: 13, items_total: 26, items_pending: 11, items_running: 1, items_completed: 10, items_skipped: 4, items_failed: 0, items_cancelled: 0}
+                attempt: 1
+                created_at: "2025-12-30 10:00:00"
+                started_at: "2025-12-30 10:00:05"
+                finished_at: null
+                _links:
+                  self: {href: /api/v1/history/downloads/dr_5f2c9a1b8e7d}
+                  items: {href: /api/v1/history/downloads/dr_5f2c9a1b8e7d/items}
+                  report: {href: /api/v1/history/downloads/dr_5f2c9a1b8e7d/report}
+                  cancel: {href: /api/v1/history/downloads/dr_5f2c9a1b8e7d/cancel, method: POST}
+        "404":
+          $ref: "#/components/responses/DownloadNotFound"
+
+  /api/v1/history/downloads/{download_id}/items:
+    get:
+      tags: [downloads]
+      summary: Пункты отчёта загрузки
+      description: |
+        Построчный результат «инструмент × интервал» с фактическим окном, счётчиками и
+        результатом загрузки. Постраничная выдача через _links.next; ссылка
+        сохраняет status и limit. Состав страницы фиксируется для последовательности
+        листания; текущие состояния пунктов могут обновляться. Ошибка привязана
+        к instrument_type, ticker, interval и window, а не к внутреннему номеру строки.
+        Счётчики свечей накопительные за все попытки загрузки. Не требует Tinkoff.
+      operationId: listDownloadItems
+      x-status: implemented
+      parameters:
+        - name: download_id
+          in: path
+          required: true
+          schema: {type: string}
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/DownloadItemStatus"
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 500, default: 100}
+        - name: cursor
+          in: query
+          required: false
+          description: Непрозрачное значение `next_cursor` прошлого ответа; клиент передаёт его без разбора и вычислений.
+          schema: {type: string, nullable: true}
+      responses:
+        "200":
+          description: Страница пунктов.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DownloadItemList"
+              example:
+                download_id: dr_5f2c9a1b8e7d
+                count: 2
+                next_cursor: "opaque-page-token"
+                total: 26
+                items:
+                  - instrument_type: future
+                    ticker: NG-2.25
+                    interval: 1d
+                    window: {from: "2024-12-05 00:00:00", to: "2025-01-16 18:45:00"}
+                    status: completed
+                    availability: {status: available}
+                    candles_received: 31
+                    candles_added: 31
+                    error: null
+                  - instrument_type: future
+                    ticker: NG-2.25
+                    interval: 1h
+                    window: {from: "2024-12-05 00:00:00", to: "2025-01-16 18:45:00"}
+                    status: running
+                    availability: {status: available}
+                    candles_received: 210
+                    candles_added: 210
+                    error: null
+                _links:
+                  self: {href: /api/v1/history/downloads/dr_5f2c9a1b8e7d/items}
+                  next: {href: "/api/v1/history/downloads/dr_5f2c9a1b8e7d/items?limit=2&cursor=opaque-page-token"}
+                  report: {href: /api/v1/history/downloads/dr_5f2c9a1b8e7d/report}
+        "404":
+          $ref: "#/components/responses/DownloadNotFound"
+
+        "400":
+          $ref: "#/components/responses/DownloadPageInvalid"
+
+  /api/v1/history/downloads/{download_id}/report:
+    get:
+      tags: [downloads]
+      summary: Сводный отчёт загрузки
+      description: |
+        Итоги прогона: статус, длительность, агрегаты по свечам и список ошибок по
+        пунктам. Доступен также до завершения: счётчики отражают текущую работу.
+        Счётчики свечей накопительные за все попытки; времена и длительность
+        относятся к текущей попытке. errors содержит только текущие ошибки пунктов,
+        error — общую ошибку разрешения цели. При доступном повторе есть retry.
+      operationId: getDownloadReport
+      x-status: implemented
+      parameters:
+        - name: download_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Отчёт.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DownloadReport"
+              example:
+                download_id: dr_5f2c9a1b8e7d
+                status: partial
+                attempt: 1
+                started_at: "2025-12-30 10:00:05"
+                finished_at: "2025-12-30 11:42:10"
+                duration_seconds: 6125
+                totals: {instruments: 13, items_total: 26, items_pending: 0, items_running: 0, items_skipped: 4, items_completed: 21, items_failed: 1, items_cancelled: 0, candles_received: 190002, candles_added: 182345}
+                errors:
+                  - instrument_type: future
+                    ticker: NG-1.26
+                    interval: 1h
+                    window: {from: "2025-11-05 00:00:00", to: "2025-12-23 18:45:00"}
+                    code: TINKOFF_UNAVAILABLE
+                    message: "Свечи NG-1.26 1h: поставщик временно недоступен."
+                _links:
+                  self: {href: /api/v1/history/downloads/dr_5f2c9a1b8e7d/report}
+                  retry: {href: /api/v1/history/downloads/dr_5f2c9a1b8e7d/retry, method: POST}
+                  items: {href: /api/v1/history/downloads/dr_5f2c9a1b8e7d/items}
+        "404":
+          $ref: "#/components/responses/DownloadNotFound"
+
+  /api/v1/history/downloads/{download_id}/cancel:
+    post:
+      tags: [downloads]
+      summary: Отменить загрузку
+      description: |
+        При pending/running принимает кооперативную отмену (202), переводит
+        ресурс в cancelling; текущая операция может ещё завершаться. Затем ресурс
+        становится cancelled. Не начавшиеся и прерванные пункты получают cancelled;
+        completed/skipped/failed и уже сохранённые свечи сохраняются.
+        Повтор при cancelling возвращает 202 без второго запроса отмены;
+        повтор при cancelled возвращает 200. Другие терминальные статусы — 409.
+        Не требует обращения к Tinkoff. Окончательный статус смотрят по Location.
+      operationId: cancelDownload
+      x-status: implemented
+      parameters:
+        - name: download_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "202":
+          description: Отмена принята, исполнение ещё может завершаться.
+          headers:
+            Location:
+              schema: {type: string}
+              example: /api/v1/history/downloads/dr_sber_2025
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DownloadResource"
+              example:
+                download_id: dr_sber_2025
+                target: {instrument_type: share, ticker: SBER}
+                range: {from: "2025-01-01 00:00:00", to: "2025-12-31 23:59:59"}
+                intervals: [1d, 1h]
+                status: cancelling
+                summary: {instruments: 1, items_total: 2, items_pending: 0, items_running: 1, items_completed: 1, items_skipped: 0, items_failed: 0, items_cancelled: 0}
+                attempt: 1
+                created_at: "2026-01-01 10:00:00"
+                started_at: "2026-01-01 10:00:01"
+                finished_at: null
+                _links:
+                  self: {href: /api/v1/history/downloads/dr_sber_2025}
+                  items: {href: /api/v1/history/downloads/dr_sber_2025/items}
+                  report: {href: /api/v1/history/downloads/dr_sber_2025/report}
+        "200":
+          description: Загрузка уже отменена; повтор идемпотентен.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DownloadResource"
+              example:
+                download_id: dr_sber_2025
+                target: {instrument_type: share, ticker: SBER}
+                range: {from: "2025-01-01 00:00:00", to: "2025-12-31 23:59:59"}
+                intervals: [1d, 1h]
+                status: cancelled
+                summary: {instruments: 1, items_total: 2, items_pending: 0, items_running: 0, items_completed: 1, items_skipped: 0, items_failed: 0, items_cancelled: 1}
+                attempt: 1
+                created_at: "2026-01-01 10:00:00"
+                started_at: "2026-01-01 10:00:01"
+                finished_at: "2026-01-01 10:01:00"
+                _links:
+                  self: {href: /api/v1/history/downloads/dr_sber_2025}
+                  items: {href: /api/v1/history/downloads/dr_sber_2025/items}
+                  report: {href: /api/v1/history/downloads/dr_sber_2025/report}
+                  retry: {href: /api/v1/history/downloads/dr_sber_2025/retry, method: POST}
+        "404":
+          $ref: "#/components/responses/DownloadNotFound"
+        "409":
+          description: Загрузку нельзя отменить в текущем статусе.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DownloadError"
+              example:
+                error: {code: INVALID_STATE, message: "Загрузка уже завершена."}
+
+  /api/v1/history/downloads/{download_id}/retry:
+    post:
+      tags: [downloads]
+      summary: Повторить неуспешную или отменённую загрузку
+      description: |
+        Допустим при partial/failed/cancelled: ставит в работу только failed и
+        cancelled, сохраняя completed/skipped. Если план ещё не построен,
+        повторяет разрешение цели. Возвращает 202 с тем же download_id,
+        увеличенным attempt и статусом pending; свечевые счётчики не обнуляются.
+        Текущие ошибки повторяемых пунктов очищаются. Требует Tinkoff.
+        При pending/running/cancelling, completed или отсутствии повторяемой
+        работы — 409. Конкурентный повтор не запускает второй набор задач.
+      operationId: retryDownload
+      x-status: implemented
+      parameters:
+        - name: download_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "202":
+          description: Повтор принят.
+          headers:
+            Location:
+              schema: {type: string}
+              example: /api/v1/history/downloads/dr_sber_2025
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DownloadResource"
+              example:
+                download_id: dr_sber_2025
+                target: {instrument_type: share, ticker: SBER}
+                range: {from: "2025-01-01 00:00:00", to: "2025-12-31 23:59:59"}
+                intervals: [1d, 1h]
+                status: pending
+                summary: {instruments: 1, items_total: 2, items_pending: 1, items_running: 0, items_completed: 1, items_skipped: 0, items_failed: 0, items_cancelled: 0}
+                attempt: 2
+                created_at: "2026-01-01 10:00:00"
+                started_at: null
+                finished_at: null
+                _links:
+                  self: {href: /api/v1/history/downloads/dr_sber_2025}
+                  items: {href: /api/v1/history/downloads/dr_sber_2025/items}
+                  report: {href: /api/v1/history/downloads/dr_sber_2025/report}
+                  cancel: {href: /api/v1/history/downloads/dr_sber_2025/cancel, method: POST}
+        "404":
+          $ref: "#/components/responses/DownloadNotFound"
+        "409":
+          description: Нет повторяемой работы или загрузка ещё выполняется.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DownloadError"
+              example:
+                error: {code: INVALID_STATE, message: "Нет неуспешной или отменённой работы для повторения."}
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/DownloadServiceUnavailable"
+
+  /api/v1/market-import/status:
+    get:
+      tags: [market-import]
+      summary: Состояние импорта из My Robot
+      description: |
+        Producer, локальный курсор, подтверждение, отставание, расхождения и
+        инструменты без карточки. К My Robot не обращается.
+      operationId: getImportStatus
+      x-status: implemented
+      responses:
+        "200":
+          description: Состояние импорта.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportStatus"
+              examples:
+                enabled:
+                  value:
+                    enabled: true
+                    source:
+                      producer_id: robot-A
+                      after_id: 123
+                      min_after_id: 0
+                      max_change_id: 130
+                      acknowledged_through: 123
+                      last_success_at: "2025-12-30 09:00:00Z"
+                      last_error: null
+                      state: ready
+                      lag_changes: 7
+                      conflicts: 0
+                      missing_instruments: 1
+                    last_error: null
+                    last_sync: {producer_id: robot-A, target_change_id: 130, snapshot_generation: 4}
+                disabled:
+                  value: {enabled: false, source: null}
+
+  /api/v1/market-import/sync:
+    post:
+      tags: [market-import]
+      summary: Внеочередная синхронизация перед прогоном
+      description: |
+        Читает границу журнала My Robot, применяет все страницы до неё, затем
+        дочитывает ленту расписаний до `has_more=false` и возвращает
+        `snapshot_generation`. Номер берётся из общего счётчика свечей и
+        расписаний, поэтому закрепляет обе ленты. Передавайте его в запросах
+        свечей, покрытия и расписаний на протяжении прогона.
+
+        Если My Robot не публикует ленту расписаний (404), свечной импорт не
+        блокируется: `schedules.state` равен `unsupported`.
+      operationId: syncMarketImport
+      x-status: implemented
+      responses:
+        "200":
+          description: Синхронизация выполнена.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportSync"
+              example:
+                producer_id: robot-A
+                target_change_id: 130
+                after_id: 130
+                synchronized: true
+                snapshot_generation: 4
+                schedules: {state: ready, after_id: 18, last_error: null}
+                source:
+                  producer_id: robot-A
+                  after_id: 130
+                  min_after_id: 0
+                  max_change_id: 130
+                  acknowledged_through: 130
+                  state: ready
+                  lag_changes: 0
+                  conflicts: 0
+                  missing_instruments: 1
+        "401":
+          description: My Robot отклонил запрос (неверный ключ).
+          content:
+            application/json:
+              schema: {type: object}
+        "409":
+          description: Источник изменился или нарушен контракт импорта.
+        "503":
+          description: Импорт My Robot не настроен или источник недоступен.
+
+  /api/v1/market-import/intervals:
+    get:
+      tags: [market-import]
+      summary: Импортированные состояния интервалов
+      description: Последние состояния покрытия для UID и таймфрейма. `pending`/`unresolved` — полнота не подтверждена.
+      operationId: getImportIntervals
+      x-status: implemented
+      parameters:
+        - name: instrument_uid
+          in: query
+          required: true
+          schema: {type: string, minLength: 1}
+        - name: interval
+          in: query
+          required: true
+          schema: {type: string, minLength: 1}
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 1000, default: 500}
+      responses:
+        "200":
+          description: Список состояний.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [count, intervals]
+                properties:
+                  count: {type: integer}
+                  intervals:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ImportIntervalStatus"
+              example:
+                count: 1
+                intervals:
+                  - producer_id: robot-A
+                    source: robot
+                    instrument_uid: uid-sber
+                    interval: 1m
+                    open_time_utc: "2025-12-30T09:59:00Z"
+                    state: ready
+                    evidence: observed
+                    observed_at: "2025-12-30T10:00:01Z"
+                    change_id: 128
+        "503":
+          description: Импорт My Robot не настроен.
+
+  /api/v1/market-import/conflicts:
+    get:
+      tags: [market-import]
+      summary: Расхождения прямых и импортированных свечей
+      description: Различия значений брокера и My Robot. Обычный исторический API отдаёт прямую свечу брокера.
+      operationId: getImportConflicts
+      x-status: implemented
+      parameters:
+        - name: instrument_uid
+          in: query
+          required: true
+          schema: {type: string, minLength: 1}
+        - name: interval
+          in: query
+          required: true
+          schema: {type: string, minLength: 1}
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 1000, default: 100}
+      responses:
+        "200":
+          description: Список расхождений.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [count, conflicts]
+                properties:
+                  count: {type: integer}
+                  conflicts:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ImportConflict"
+              example:
+                count: 1
+                conflicts:
+                  - producer_id: robot-A
+                    source: robot
+                    instrument_uid: uid-sber
+                    interval: 1m
+                    open_time_utc: "2025-12-30T09:59:00Z"
+                    revision: 2
+                    change_id: 127
+                    imported_open: 100.1
+                    imported_high: 101.0
+                    imported_low: 99.0
+                    imported_close: 100.5
+                    imported_volume: 1000
+                    broker_open: 100.0
+                    broker_high: 101.0
+                    broker_low: 99.0
+                    broker_close: 100.5
+                    broker_volume: 1000
+        "503":
+          description: Импорт My Robot не настроен.
+
+  /api/v1/market-import/missing-instruments:
+    get:
+      tags: [market-import]
+      summary: Инструменты с незагруженной карточкой
+      description: UID импортированных свечей без карточки брокера, время последней попытки и её ошибка.
+      operationId: getMissingInstruments
+      x-status: implemented
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 1000, default: 100}
+      responses:
+        "200":
+          description: Список инструментов.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [count, instruments]
+                properties:
+                  count: {type: integer}
+                  instruments:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/MissingInstrument"
+              example:
+                count: 1
+                instruments:
+                  - instrument_uid: uid-unknown
+                    last_attempt_at: "2025-12-30T09:30:00Z"
+                    last_error: "Инструмент не найден в Tinkoff."
+        "503":
+          description: Импорт My Robot не настроен.
+
+components:
+  schemas:
+    QualityStatus:
+      type: string
+      enum: [unknown, warning, not_ready]
+      description: "Приоритет: not_ready > warning > unknown. ready не выдаётся без подтверждённой полноты."
+
+    QualityReportRequest:
+      type: object
+      additionalProperties: false
+      required: [requests]
+      properties:
+        snapshot:
+          type: string
+          nullable: true
+          minLength: 1
+          description: Непрозрачный снимок публичного чтения; без него создаётся новый.
+        requests:
+          type: array
+          minItems: 1
+          maxItems: 256
+          description: Пары и участки; порядок сохраняется в results.
+          items:
+            $ref: "#/components/schemas/QualityRequestItem"
+        sample_limit:
+          type: integer
+          minimum: 0
+          maximum: 100
+          default: 20
+          description: Максимум примеров пауз и дефектов на пару; 0 — только итоги.
+
+    QualityRequestItem:
+      type: object
+      additionalProperties: false
+      required: [instrument_type, ticker, interval, from, to]
+      properties:
+        instrument_type:
+          $ref: "#/components/schemas/InstrumentType"
+        ticker:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: Тикер из каталога на снимке; пробелы запрещены.
+        interval:
+          $ref: "#/components/schemas/Interval"
+        from:
+          type: string
+          description: Начало включительно; дата или ISO 8601 до целой секунды, UTC.
+        to:
+          type: string
+          description: Конец включительно; дата без времени означает конец дня UTC.
+        warmup_bars:
+          type: integer
+          minimum: 0
+          maximum: 100000
+          default: 0
+          description: Нужно корректных закрытых баров до начала. Проверяются последние N закрытых свечей, без подмены дефектных более старыми.
+
+    QualityReportResponse:
+      type: object
+      required: [report_version, snapshot, status, count, results]
+      properties:
+        report_version: {type: integer, enum: [1]}
+        snapshot: {type: string, description: Токен для последующего чтения тех же данных.}
+        status:
+          $ref: "#/components/schemas/QualityStatus"
+        count: {type: integer, description: Число результатов.}
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/QualityResult"
+
+    QualityResult:
+      type: object
+      required: [instrument_type, ticker, interval, requested_from, requested_to, status, completeness, first, last, count, warmup, invalid_count, invalid_samples, invalid_samples_truncated, pause_count, longest_pause_seconds, pauses, pauses_truncated, issues]
+      properties:
+        instrument_type:
+          $ref: "#/components/schemas/InstrumentType"
+        ticker: {type: string}
+        interval:
+          $ref: "#/components/schemas/Interval"
+        requested_from: {type: string, description: Нормализованное начало UTC; при ошибке — исходное значение.}
+        requested_to: {type: string, description: Нормализованный конец UTC; при ошибке — исходное значение.}
+        status:
+          $ref: "#/components/schemas/QualityStatus"
+        completeness: {type: string, enum: [unknown], description: Полнота пока не подтверждается.}
+        first: {type: string, nullable: true, description: Первое сохранённое открытие диапазона.}
+        last: {type: string, nullable: true, description: Последнее сохранённое открытие диапазона.}
+        count: {type: integer, description: Число свечей диапазона включая дефектные.}
+        warmup:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/QualityWarmup"
+          description: null при ошибке пары до анализа истории.
+        invalid_count: {type: integer, description: Полное число дефектных свечей диапазона.}
+        invalid_samples:
+          type: array
+          items:
+            $ref: "#/components/schemas/InvalidCandleSample"
+        invalid_samples_truncated: {type: boolean, description: Не все дефекты вошли в примеры.}
+        pause_count: {type: integer, description: Полное число наблюдаемых пауз между корректными метками; это не число доказанных потерь.}
+        longest_pause_seconds: {type: integer, description: Максимальная пауза от ожидаемого открытия до следующей свечи.}
+        pauses:
+          type: array
+          description: До sample_limit наиболее длинных пауз, затем по времени предыдущей свечи.
+          items:
+            $ref: "#/components/schemas/ObservedPause"
+        pauses_truncated: {type: boolean, description: Не все паузы вошли в примеры.}
+        issues:
+          type: array
+          items:
+            $ref: "#/components/schemas/QualityIssue"
+
+    QualityWarmup:
+      type: object
+      required: [required, available, invalid_count, satisfied]
+      properties:
+        required: {type: integer, description: Запрошенное число закрытых баров.}
+        available: {type: integer, description: Корректные среди последних required закрытых баров.}
+        invalid_count: {type: integer, description: Дефектные среди выбранных баров прогрева.}
+        satisfied: {type: boolean, description: Достаточно корректных баров для запроса.}
+
+    QualityIssue:
+      type: object
+      required: [code, message, count]
+      properties:
+        code:
+          type: string
+          description: COMPLETENESS_UNKNOWN, OBSERVED_PAUSES, START_NOT_CONFIRMED, END_NOT_CONFIRMED, NO_CANDLES, INVALID_CANDLES, INSUFFICIENT_WARMUP или код ошибки разрешения пары/диапазона.
+        message: {type: string, description: Объяснение.}
+        count: {type: integer, nullable: true, description: Число затронутых свечей/пауз, если известно.}
+
+    ObservedPause:
+      type: object
+      required: [previous, following, pause_from, duration_seconds]
+      properties:
+        previous: {type: string, description: Открытие свечи перед паузой в UTC.}
+        following: {type: string, description: Открытие следующей имеющейся свечи в UTC.}
+        pause_from: {type: string, description: Ожидаемое следующее открытие по интервалу в UTC.}
+        duration_seconds: {type: integer, description: Наблюдаемая пауза; причина неизвестна.}
+
+    InvalidCandleSample:
+      type: object
+      required: [timestamp, codes]
+      properties:
+        timestamp: {type: string, description: Сохранённая временная метка проблемной свечи.}
+        codes:
+          type: array
+          items: {type: string, enum: [INVALID_TIMESTAMP, INVALID_OHLC, INVALID_VOLUME]}
+
+    Interval:
+      type: string
+      enum: [1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w, 1M]
+      description: Таймфрейм свечей.
+
+    InstrumentType:
+      type: string
+      enum: [share, future, etf, currency]
+      description: Тип инструмента.
+
+    DownloadInstrumentType:
+      type: string
+      enum: [share, future]
+      description: Тип инструмента для проектируемой загрузки. Акции и фьючерсы поддерживаются явно; ETF и валюты пока не входят в этот контракт.
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Стабильный машинный код ошибки.
+            message:
+              type: string
+              description: Человекочитаемое пояснение.
+
+    Link:
+      type: object
+      required: [href]
+      properties:
+        href: {type: string, description: Относительный URL ресурса.}
+        method: {type: string, description: "HTTP-метод, если отличен от GET."}
+
+    LinksDocument:
+      type: object
+      required: [_links]
+      properties:
+        _links:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/Link"
+
+    Candle:
+      type: object
+      additionalProperties: false
+      required: [datetime, open, high, low, close, volume]
+      properties:
+        datetime:
+          type: string
+          description: Время открытия свечи, наивный UTC, `YYYY-MM-DD HH:MM:SS`.
+          example: "2024-01-01 10:00:00"
+        open: {type: number, format: double}
+        high: {type: number, format: double}
+        low: {type: number, format: double}
+        close: {type: number, format: double}
+        volume: {type: integer}
+
+    CandlesResponse:
+      type: object
+      additionalProperties: false
+      required: [instrument_type, ticker, interval, range, snapshot, count, total, candles, _links]
+      properties:
+        instrument_type:
+          $ref: "#/components/schemas/InstrumentType"
+        ticker:
+          $ref: "#/components/schemas/PublicTicker"
+        interval:
+          $ref: "#/components/schemas/Interval"
+        range:
+          $ref: "#/components/schemas/ReadRange"
+        snapshot:
+          $ref: "#/components/schemas/ReadSnapshotToken"
+        count: {type: integer, description: Число свечей на странице.}
+        total:
+          type: integer
+          nullable: true
+          description: Всего свечей в снимке в диапазоне; null, только если отсутствуют обе границы.
+        next_cursor:
+          type: string
+          nullable: true
+          description: Непрозрачное продолжение; null на последней странице. Клиент следует _links.next.
+        candles:
+          type: array
+          items:
+            $ref: "#/components/schemas/Candle"
+        _links:
+          type: object
+          description: self, instrument и next при наличии продолжения; next сохраняет инструмент, интервал, диапазон, лимит и snapshot.
+          additionalProperties:
+            $ref: "#/components/schemas/Link"
+
+    PublicTicker:
+      type: string
+      minLength: 1
+      pattern: '^\S+$'
+      description: Публичный тикер в канонической форме каталога; в URL кодируется как сегмент пути. UID/FIGI не интерпретируются как альтернативные ключи.
+
+    ReadSnapshotToken:
+      type: string
+      minLength: 1
+      description: Непрозрачный снимок данных и каталога; создаётся сервером и передаётся клиентом без интерпретации. Числовые поколения БД не принимаются.
+
+    ReadTimeBound:
+      type: string
+      pattern: '^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})?)?$'
+      description: Дата либо ISO timestamp с целыми секундами. from без времени — начало дня UTC; to — конец дня. Корректность календаря и порядок проверяет сервис.
+
+    ReadRange:
+      type: object
+      required: [from, to]
+      properties:
+        from: {type: string, nullable: true, description: Нормализованная граница UTC; null при отсутствии ограничения.}
+        to: {type: string, nullable: true, description: Нормализованная граница UTC; null при отсутствии ограничения.}
+
+    InstrumentReadProblem:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Стабильный код; VALIDATION_ERROR, INVALID_INTERVAL, INVALID_INSTRUMENT_TYPE, INVALID_TIME_RANGE, INVALID_PAGE_LIMIT, INVALID_CURSOR, INVALID_SNAPSHOT, INSTRUMENT_NOT_FOUND, AMBIGUOUS_INSTRUMENT, INSTRUMENT_METADATA_PENDING, COVERAGE_NOT_CONFIRMED, NO_TRADES, MARKET_CLOSED.
+        message: {type: string, description: Пояснение пользователю; не разбирается клиентом.}
+
+    InstrumentReadError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          $ref: "#/components/schemas/InstrumentReadProblem"
+
+    CandleQuery:
+      type: object
+      additionalProperties: false
+      required: [instrument_type, ticker, interval]
+      properties:
+        instrument_type: {type: string, description: Тип проверяется поэлементно; неверный тип не отменяет остальные запросы.}
+        ticker: {type: string, description: Тикер проверяется и разрешается поэлементно.}
+        interval:
+          type: string
+          description: Валидируется по-элементно; неверный интервал попадает в `error`.
+        from: {type: string, nullable: true}
+        to: {type: string, nullable: true}
+        limit: {type: integer, nullable: true}
+        cursor: {type: string, nullable: true}
+      description: Строки дат и допустимые значения проверяются сервисом поэлементно; неверный тип JSON-поля является ошибкой всего тела запроса. UID/FIGI не поддерживаются.
+
+    CandleBatchRequest:
+      type: object
+      additionalProperties: false
+      required: [requests]
+      properties:
+        requests:
+          type: array
+          minItems: 1
+          maxItems: 256
+          items:
+            $ref: "#/components/schemas/CandleQuery"
+        snapshot:
+          $ref: "#/components/schemas/ReadSnapshotToken"
+
+    CandleBatchItem:
+      type: object
+      additionalProperties: false
+      required: [instrument_type, ticker, interval, range, count, total, candles, error, _links]
+      properties:
+        instrument_type: {type: string, description: Эхо подзапроса; может быть неверным при наличии error.}
+        ticker: {type: string}
+        interval: {type: string}
+        range:
+          type: object
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/ReadRange"
+          description: Нормализованный диапазон; null при невозможности разбора подзапроса.
+        count: {type: integer}
+        total: {type: integer, nullable: true}
+        next_cursor: {type: string, nullable: true}
+        candles:
+          type: array
+          items:
+            $ref: "#/components/schemas/Candle"
+        error:
+          type: object
+          allOf:
+            - $ref: "#/components/schemas/InstrumentReadProblem"
+          nullable: true
+          description: Ошибка этого подзапроса; остальные подзапросы не отменяет.
+        _links:
+          type: object
+          description: При успехе ссылки на карточку и следующую страницу свечей; при ошибке может быть пустым.
+          additionalProperties:
+            $ref: "#/components/schemas/Link"
+
+    CandleBatchResponse:
+      type: object
+      required: [count, snapshot, results]
+      properties:
+        count: {type: integer}
+        snapshot:
+          $ref: "#/components/schemas/ReadSnapshotToken"
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/CandleBatchItem"
+
+    CoverageResponse:
+      type: object
+      additionalProperties: false
+      required: [instrument_type, ticker, interval, requested_range, available_range, count, status, snapshot, _links]
+      properties:
+        instrument_type:
+          $ref: "#/components/schemas/InstrumentType"
+        ticker:
+          $ref: "#/components/schemas/PublicTicker"
+        interval:
+          $ref: "#/components/schemas/Interval"
+        requested_range:
+          $ref: "#/components/schemas/ReadRange"
+        available_range:
+          type: object
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/EchoRange"
+          description: Крайние сохранённые свечи внутри запрошенного диапазона; null при count=0. Не доказывает непрерывность.
+        count: {type: integer}
+        status:
+          type: string
+          enum: [complete, partial, missing, unknown]
+          description: complete подтверждён исполнением/источником, а не крайними свечами. Без доказательства — unknown; missing — данных нет. Подтверждённое отсутствие торгов может дать complete и count=0.
+        reason:
+          $ref: "#/components/schemas/InstrumentReadProblem"
+        snapshot:
+          $ref: "#/components/schemas/ReadSnapshotToken"
+        _links:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/Link"
+
+    Instrument:
+      type: object
+      additionalProperties: false
+      required: [ticker, instrument_type, _links]
+      properties:
+        ticker:
+          $ref: "#/components/schemas/PublicTicker"
+        instrument_type:
+          $ref: "#/components/schemas/InstrumentType"
+        name: {type: string, nullable: true}
+        class_code: {type: string, nullable: true}
+        currency: {type: string, nullable: true}
+        lot: {type: integer, nullable: true}
+        min_price_increment: {type: number, nullable: true}
+        min_price_increment_amount: {type: number, nullable: true}
+        initial_margin_on_buy: {type: number, nullable: true}
+        initial_margin_on_sell: {type: number, nullable: true}
+        expiration_date:
+          type: string
+          nullable: true
+          description: ISO 8601 со смещением `+00:00`; `null` для бессрочных.
+        basic_asset:
+          type: string
+          nullable: true
+          description: Базовый актив фьючерса как человекочитаемое имя (`Газ (США)`, `Brent`); `null` для не-фьючерсов. Соответствует полю `Future.basic_asset` Tinkoff. Код серии (`NG`) хранится отдельно в `base_code` и в API не публикуется.
+        basic_asset_size:
+          type: number
+          nullable: true
+          description: Размер базового актива в контракте; соответствует `Future.basic_asset_size` (Quotation) Tinkoff.
+        first_trade_date:
+          type: string
+          nullable: true
+          description: Момент начала обращения контракта, ISO 8601 со смещением `+00:00`; `null` у не-фьючерсов и при отсутствии данных. Соответствует `Future.first_trade_date`; дата не синтезируется.
+        last_trade_date:
+          type: string
+          nullable: true
+          description: Момент последней торговли контрактом, ISO 8601 со смещением `+00:00`; `null`, если источник не отдал. Соответствует `Future.last_trade_date`.
+        snapshot:
+          $ref: "#/components/schemas/ReadSnapshotToken"
+        _links:
+          type: object
+          description: self, candles и coverage относятся к этому же типу и тикеру.
+          additionalProperties:
+            $ref: "#/components/schemas/Link"
+
+    TinkoffInstrument:
+      type: object
+      description: Неизменяемое UID-представление, совместимое с используемым Tinkoff API.
+      required: [instrument_id, ticker, instrument_type]
+      properties:
+        instrument_id: {type: string}
+        figi: {type: string, nullable: true}
+        ticker: {type: string}
+        instrument_type: {type: string}
+        name: {type: string, nullable: true}
+        class_code: {type: string, nullable: true}
+        currency: {type: string, nullable: true}
+        lot: {type: integer, nullable: true}
+        min_price_increment: {type: number, nullable: true}
+        min_price_increment_amount: {type: number, nullable: true}
+        initial_margin_on_buy: {type: number, nullable: true}
+        initial_margin_on_sell: {type: number, nullable: true}
+        expiration_date: {type: string, nullable: true}
+        basic_asset: {type: string, nullable: true, description: "Базовый актив фьючерса; соответствует Future.basic_asset Tinkoff."}
+        basic_asset_size: {type: number, nullable: true, description: "Размер базового актива; соответствует Future.basic_asset_size Tinkoff."}
+        first_trade_date: {type: string, nullable: true, description: "Момент начала обращения, ISO 8601 +00:00; соответствует Future.first_trade_date."}
+        last_trade_date: {type: string, nullable: true, description: "Момент последней торговли, ISO 8601 +00:00; соответствует Future.last_trade_date."}
+
+    InstrumentList:
+      type: object
+      additionalProperties: false
+      required: [count, total, snapshot, instruments, _links]
+      properties:
+        count: {type: integer, minimum: 0, description: Число инструментов на странице.}
+        total: {type: integer, minimum: 0, description: Полное количество подходящих инструментов в снимке с учётом всех фильтров.}
+        snapshot:
+          $ref: "#/components/schemas/ReadSnapshotToken"
+        next_cursor: {type: string, nullable: true, description: Непрозрачное продолжение; null на последней странице.}
+        instruments:
+          type: array
+          items:
+            $ref: "#/components/schemas/Instrument"
+        _links:
+          type: object
+          description: self и next при наличии продолжения; next сохраняет фильтры, лимит и snapshot.
+          additionalProperties:
+            $ref: "#/components/schemas/Link"
+
+    DownloadSelectionResponse:
+      type: object
+      additionalProperties: false
+      required: [target, range, intervals, summary, items, excluded, _links]
+      properties:
+        target:
+          $ref: "#/components/schemas/DownloadTarget"
+        range:
+          $ref: "#/components/schemas/EchoRange"
+        intervals:
+          type: array
+          items:
+            $ref: "#/components/schemas/Interval"
+        summary:
+          type: object
+          required: [instruments, items_total, items_already_covered, items_to_fetch, items_unavailable]
+          description: items_total равно сумме трёх счётчиков результатов плана; excluded в него не входит.
+          properties:
+            instruments: {type: integer, minimum: 0}
+            items_total: {type: integer, minimum: 0}
+            items_already_covered: {type: integer, minimum: 0}
+            items_to_fetch: {type: integer, minimum: 0}
+            items_unavailable: {type: integer, minimum: 0}
+        items:
+          type: array
+          description: Полный план без пагинации; одна запись на инструмент и интервал.
+          items:
+            $ref: "#/components/schemas/DownloadSelectionItem"
+        excluded:
+          type: array
+          description: Инструменты серии, исключённые из выборки по периоду или недоступным метаданным.
+          items:
+            type: object
+            additionalProperties: false
+            required: [instrument_type, ticker, reason]
+            properties:
+              instrument_type:
+                $ref: "#/components/schemas/DownloadInstrumentType"
+              ticker: {type: string}
+              reason:
+                $ref: "#/components/schemas/DownloadProblem"
+        _links:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/Link"
+
+    DownloadSelectionItem:
+      type: object
+      additionalProperties: false
+      required: [instrument_type, ticker, interval, window, availability, coverage, action]
+      properties:
+        instrument_type:
+          $ref: "#/components/schemas/DownloadInstrumentType"
+        ticker: {type: string}
+        interval:
+          $ref: "#/components/schemas/Interval"
+        window:
+          $ref: "#/components/schemas/EchoRange"
+        availability:
+          $ref: "#/components/schemas/DownloadAvailability"
+        coverage:
+          type: object
+          required: [status, count]
+          properties:
+            status:
+              type: string
+              enum: [complete, partial, missing, unknown]
+              description: complete подтверждён исполнением или сведениями о торгах; MIN/MAX/COUNT недостаточно. unknown не позволяет пропустить проверку.
+            count: {type: integer, minimum: 0, description: Число уже имеющихся свечей; не оценка ожидаемого количества.}
+        action:
+          type: string
+          enum: [download, skip, unavailable]
+          description: Ожидаемый результат планирования; клиент не задаёт эту стратегию.
+        reason:
+          $ref: "#/components/schemas/DownloadProblem"
+        _links:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/Link"
+
+    DownloadAvailability:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [available, partial, unavailable, unknown]
+          description: Доступность данных поставщика для требуемого окна; не наличие свечей в локальном хранилище.
+        available_window:
+          type: object
+          nullable: true
+          required: [from, to]
+          properties:
+            from: {type: string}
+            to: {type: string}
+          description: Доступные границы внутри требуемого окна; не гарантия непрерывных торгов. null означает отсутствие доступного периода.
+        reason:
+          $ref: "#/components/schemas/DownloadProblem"
+
+    DownloadProblem:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: |
+            Стабильная причина/ошибка. Коды: INSTRUMENT_NOT_FOUND,
+            AMBIGUOUS_INSTRUMENT, PERIOD_NOT_AVAILABLE, HISTORY_DEPTH_LIMIT,
+            NO_MATCHING_INSTRUMENTS, METADATA_UNAVAILABLE, TINKOFF_UNAVAILABLE,
+            DOWNLOAD_NOT_FOUND, DOWNLOAD_UNAVAILABLE, INVALID_STATE, INVALID_CURSOR, VALIDATION_ERROR,
+            ALREADY_AVAILABLE, NO_TRADES, MARKET_CLOSED, OUTSIDE_REQUESTED_PERIOD.
+        message: {type: string, description: Пояснение для пользователя; клиент не разбирает текст.}
+
+    DownloadError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          $ref: "#/components/schemas/DownloadProblem"
+
+    DateRange:
+      type: object
+      additionalProperties: false
+      required: [from, to]
+      properties:
+        from:
+          type: string
+          pattern: '^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})?)?$'
+          description: Начало включительно; дата без времени означает начало дня UTC. Timestamp задаётся с целыми секундами; смещение переводится в UTC. Календарная корректность проверяется сервисом.
+        to:
+          type: string
+          pattern: '^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})?)?$'
+          description: Конец включительно; дата без времени означает конец указанного дня UTC (23:59:59). После нормализации to должен быть позже from; timestamp с целыми секундами. Календарная корректность проверяется сервисом.
+
+    EchoRange:
+      type: object
+      required: [from, to]
+      properties:
+        from: {type: string}
+        to: {type: string}
+
+    DownloadTarget:
+      type: object
+      additionalProperties: false
+      description: |
+        Тип инструмента обязателен. `ticker` — один инструмент (акция или
+        фьючерс); base_asset — серия фьючерсов и допустим только для future.
+        Ровно одно из двух полей. UID/FIGI не являются публичными параметрами.
+        Тикер должен однозначно определять инструмент в пределах типа; иначе
+        AMBIGUOUS_INSTRUMENT без случайного выбора; однозначность поддерживает
+        сервис в своём каталоге. Пустые строки и null недопустимы.
+      required: [instrument_type]
+      oneOf:
+        - required: [base_asset]
+          properties:
+            instrument_type: {type: string, enum: [future]}
+          not:
+            required: [ticker]
+        - required: [ticker]
+          not:
+            required: [base_asset]
+      properties:
+        instrument_type:
+          $ref: "#/components/schemas/DownloadInstrumentType"
+        base_asset:
+          type: string
+          minLength: 1
+          pattern: '\S'
+          description: >-
+            Серия фьючерсов. Принимает код серии (например `NG`, `GOLD`, `SBRF`)
+            или значение `basic_asset` из карточки Tinkoff (например `Газ (США)`,
+            `Brent`). Регистр не важен.
+        ticker:
+          $ref: "#/components/schemas/PublicTicker"
+
+    DownloadCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [target, range, intervals]
+      properties:
+        target:
+          $ref: "#/components/schemas/DownloadTarget"
+        range:
+          $ref: "#/components/schemas/DateRange"
+        intervals:
+          type: array
+          minItems: 1
+          maxItems: 9
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/Interval"
+
+    DownloadStatus:
+      type: string
+      enum: [pending, running, cancelling, completed, partial, failed, cancelled]
+      description: |
+        pending/running — выполнение, cancelling — принята кооперативная отмена.
+        completed — все пункты completed/skipped; partial — есть failed и
+        completed/skipped; failed — все пункты failed либо цель не разрешена.
+        cancelled — исполнение остановлено; завершённые данные сохранены.
+        Последние четыре статуса терминальные. После принятого retry — pending.
+
+    DownloadItemStatus:
+      type: string
+      enum: [pending, running, completed, skipped, failed, cancelled]
+
+    DownloadSummary:
+      type: object
+      required: [instruments, items_total, items_pending, items_running, items_completed, items_skipped, items_failed, items_cancelled]
+      description: До построения плана все счётчики равны нулю. После него items_total равен сумме счётчиков статусов.
+      properties:
+        instruments: {type: integer, minimum: 0, description: Число выбранных инструментов (одна акция или выбранные фьючерсные контракты).}
+        items_total: {type: integer, minimum: 0}
+        items_pending: {type: integer, minimum: 0}
+        items_running: {type: integer, minimum: 0}
+        items_completed: {type: integer, minimum: 0}
+        items_skipped: {type: integer, minimum: 0}
+        items_failed: {type: integer, minimum: 0}
+        items_cancelled: {type: integer, minimum: 0}
+
+    DownloadResource:
+      type: object
+      additionalProperties: false
+      required: [download_id, target, range, intervals, status, summary, attempt, created_at, started_at, finished_at, _links]
+      example:
+        download_id: dr_sber_2025
+        target: {instrument_type: share, ticker: SBER}
+        range: {from: "2025-01-01 00:00:00", to: "2025-12-31 23:59:59"}
+        intervals: [1d, 1h]
+        status: completed
+        summary: {instruments: 1, items_total: 2, items_pending: 0, items_running: 0, items_completed: 2, items_skipped: 0, items_failed: 0, items_cancelled: 0}
+        attempt: 1
+        created_at: "2026-01-01 10:00:00"
+        started_at: "2026-01-01 10:00:01"
+        finished_at: "2026-01-01 10:02:00"
+        _links:
+          self: {href: /api/v1/history/downloads/dr_sber_2025}
+          items: {href: /api/v1/history/downloads/dr_sber_2025/items}
+          report: {href: /api/v1/history/downloads/dr_sber_2025/report}
+      properties:
+        download_id: {type: string}
+        target:
+          $ref: "#/components/schemas/DownloadTarget"
+        range:
+          $ref: "#/components/schemas/EchoRange"
+        intervals:
+          type: array
+          items:
+            $ref: "#/components/schemas/Interval"
+        status:
+          $ref: "#/components/schemas/DownloadStatus"
+        summary:
+          $ref: "#/components/schemas/DownloadSummary"
+        attempt: {type: integer, minimum: 1, description: "Номер попытки загрузки; retry увеличивает его, повторный идентичный POST — нет."}
+        error:
+          type: object
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/DownloadProblem"
+          description: Общая ошибка загрузки, включая сбой разрешения цели до создания пунктов.
+        created_at: {type: string, description: Время первоначального создания ресурса; при retry не меняется.}
+        started_at: {type: string, nullable: true, description: Начало текущей попытки; null до её старта.}
+        finished_at: {type: string, nullable: true, description: Завершение текущей попытки; null при pending/running/cancelling и после принятого retry.}
+        _links:
+          type: object
+          description: cancel доступен при pending/running; retry — при partial/failed/cancelled с повторяемой работой. Отсутствующая ссылка означает недоступное действие.
+          additionalProperties:
+            $ref: "#/components/schemas/Link"
+
+    DownloadResourceList:
+      type: object
+      required: [count, total, downloads, _links]
+      properties:
+        count: {type: integer}
+        total: {type: integer, description: Число записей в зафиксированной выборке журнала.}
+        next_cursor: {type: string, nullable: true}
+        downloads:
+          type: array
+          items:
+            $ref: "#/components/schemas/DownloadResource"
+        _links:
+          type: object
+          description: self и, если есть продолжение, next с сохранёнными фильтрами и лимитом.
+          additionalProperties:
+            $ref: "#/components/schemas/Link"
+
+    DownloadItem:
+      type: object
+      additionalProperties: false
+      required: [instrument_type, ticker, interval, window, availability, status, candles_received, candles_added]
+      properties:
+        instrument_type:
+          $ref: "#/components/schemas/DownloadInstrumentType"
+        ticker: {type: string}
+        interval: {type: string}
+        window:
+          $ref: "#/components/schemas/EchoRange"
+        availability:
+          $ref: "#/components/schemas/DownloadAvailability"
+        status:
+          $ref: "#/components/schemas/DownloadItemStatus"
+        candles_received: {type: integer, minimum: 0, description: Число свечей полученных от поставщика за все попытки; повторная выдача учитывается.}
+        candles_added: {type: integer, minimum: 0, description: "Новые уникальные свечи, добавленные этой загрузкой за все попытки. Повтор и изменение цены существующей свечи не увеличивают счётчик."}
+        reason:
+          $ref: "#/components/schemas/DownloadProblem"
+        error:
+          type: object
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/DownloadProblem"
+          description: Обязателен при status=failed; при успешном повторе очищается. Отмена не считается ошибкой.
+        _links:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/Link"
+
+    DownloadItemList:
+      type: object
+      required: [download_id, count, total, items]
+      properties:
+        download_id: {type: string}
+        count: {type: integer}
+        next_cursor: {type: string, nullable: true}
+        total: {type: integer}
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/DownloadItem"
+        _links:
+          type: object
+          description: self, report и next при наличии продолжения; next сохраняет фильтры и лимит.
+          additionalProperties:
+            $ref: "#/components/schemas/Link"
+
+    DownloadReport:
+      type: object
+      required: [download_id, status, attempt, totals, errors, _links]
+      properties:
+        download_id: {type: string}
+        status:
+          $ref: "#/components/schemas/DownloadStatus"
+        attempt: {type: integer, minimum: 1}
+        started_at: {type: string, nullable: true}
+        finished_at: {type: string, nullable: true}
+        duration_seconds: {type: integer, nullable: true}
+        totals:
+          type: object
+          required: [instruments, items_total, items_pending, items_running, items_completed, items_skipped, items_failed, items_cancelled, candles_received, candles_added]
+          properties:
+            instruments: {type: integer}
+            items_total: {type: integer}
+            items_pending: {type: integer}
+            items_running: {type: integer}
+            items_skipped: {type: integer}
+            items_completed: {type: integer}
+            items_failed: {type: integer}
+            items_cancelled: {type: integer}
+            candles_received: {type: integer}
+            candles_added: {type: integer, description: Сумма новых уникальных свечей по пунктам за все попытки загрузки.}
+        error:
+          type: object
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/DownloadProblem"
+          description: Общая ошибка до построения плана; ошибки пунктов находятся в errors.
+        errors:
+          type: array
+          items:
+            $ref: "#/components/schemas/DownloadItemError"
+        _links:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/Link"
+
+    DownloadItemError:
+      type: object
+      additionalProperties: false
+      required: [instrument_type, ticker, interval, window, code, message]
+      properties:
+        instrument_type:
+          $ref: "#/components/schemas/DownloadInstrumentType"
+        ticker: {type: string}
+        interval: {type: string}
+        window:
+          $ref: "#/components/schemas/EchoRange"
+        code: {type: string}
+        message: {type: string}
+
+    ImportStatus:
+      type: object
+      required: [enabled]
+      properties:
+        enabled: {type: boolean}
+        source:
+          allOf:
+            - $ref: "#/components/schemas/ImportSource"
+          nullable: true
+        schedules:
+          allOf:
+            - $ref: "#/components/schemas/ScheduleImportSource"
+          nullable: true
+        last_error: {type: string, nullable: true}
+        last_sync: {type: object, nullable: true, additionalProperties: true}
+
+    ImportSource:
+      type: object
+      properties:
+        producer_id: {type: string}
+        after_id: {type: integer}
+        min_after_id: {type: integer}
+        max_change_id: {type: integer}
+        acknowledged_through: {type: integer}
+        last_success_at: {type: string, nullable: true}
+        last_error: {type: string, nullable: true}
+        state: {type: string, description: ready | pending | blocked | error}
+        lag_changes: {type: integer}
+        conflicts: {type: integer}
+        missing_instruments: {type: integer}
+
+    ImportSync:
+      type: object
+      properties:
+        producer_id: {type: string}
+        target_change_id: {type: integer}
+        after_id: {type: integer}
+        synchronized: {type: boolean}
+        snapshot_generation: {type: integer}
+        source:
+          $ref: "#/components/schemas/ImportSource"
+        schedules:
+          type: object
+          properties:
+            state: {type: string, description: ready | unsupported}
+            after_id: {type: integer, description: Курсор schedule_change_id.}
+            last_error: {type: string, nullable: true}
+
+    ScheduleImportSource:
+      type: object
+      properties:
+        producer_id: {type: string}
+        after_id: {type: integer, description: Последний применённый schedule_change_id.}
+        acknowledged_through: {type: integer}
+        last_success_at: {type: string, nullable: true}
+        last_error: {type: string, nullable: true}
+        state: {type: string, description: ready | unsupported | blocked | error}
+        days: {type: integer, description: Число сохранённых версий дней.}
+        bindings: {type: integer, description: Число UID с привязкой к режиму торгов.}
+        exchanges: {type: array, items: {type: string}}
+
+    TradingScheduleResponse:
+      type: object
+      required: [instrument_id, exchange, binding_provenance, from, to, snapshot_generation, days, missing_dates]
+      properties:
+        instrument_id: {type: string}
+        exchange: {type: string, nullable: true, description: Код режима торгов в нижнем регистре.}
+        binding_provenance:
+          type: string
+          nullable: true
+          enum: [my_robot_export, reconstructed]
+          description: Происхождение привязки UID к режиму; импортированная главнее восстановленной.
+        from: {type: string, format: date, description: Первая торговая дата диапазона (МСК).}
+        to: {type: string, format: date, description: Последняя торговая дата диапазона (МСК).}
+        snapshot_generation: {type: integer}
+        days:
+          type: array
+          items: {$ref: "#/components/schemas/TradingScheduleDay"}
+        missing_dates:
+          type: array
+          items: {type: string, format: date}
+          description: Даты диапазона без дня расписания — ни из ленты, ни восстановленного.
+
+    TradingScheduleDay:
+      type: object
+      required: [trading_date, exchange, version, is_trading_day, source, provenance, rules_version, observed_at, last_confirmed_at, day]
+      properties:
+        trading_date: {type: string, format: date}
+        exchange: {type: string}
+        version: {type: string, description: sha256 канонического JSON TradingDay.}
+        is_trading_day: {type: boolean}
+        source: {type: string, example: tbank, description: "У восстановленных дней — `emulator-reconstructed`."}
+        provenance:
+          type: string
+          enum: [my_robot_export, reconstructed]
+          description: "`my_robot_export` — день из ленты робота; `reconstructed` — восстановлен эмулятором по правилам сессий."
+        rules_version:
+          type: string
+          nullable: true
+          description: Версия файла правил; только у восстановленных дней.
+        observed_at: {type: string, description: У восстановленных дней — момент генерации.}
+        last_confirmed_at: {type: string, description: У восстановленных дней — момент генерации.}
+        day:
+          type: object
+          additionalProperties: true
+          description: TradingDay; моменты — ISO 8601 UTC с суффиксом Z. У восстановленных — та же каноническая форма, что у брокера.
+
+    ImportIntervalStatus:
+      type: object
+      properties:
+        producer_id: {type: string}
+        source: {type: string}
+        instrument_uid: {type: string}
+        interval: {type: string}
+        open_time_utc: {type: string}
+        state: {type: string, description: ready | pending | unresolved}
+        evidence: {type: string, nullable: true}
+        observed_at: {type: string, nullable: true}
+        change_id: {type: integer}
+
+    ImportConflict:
+      type: object
+      properties:
+        producer_id: {type: string}
+        source: {type: string}
+        instrument_uid: {type: string}
+        interval: {type: string}
+        open_time_utc: {type: string}
+        revision: {type: integer}
+        change_id: {type: integer}
+        imported_open: {type: number}
+        imported_high: {type: number}
+        imported_low: {type: number}
+        imported_close: {type: number}
+        imported_volume: {type: integer}
+        broker_open: {type: number}
+        broker_high: {type: number}
+        broker_low: {type: number}
+        broker_close: {type: number}
+        broker_volume: {type: integer}
+
+    MissingInstrument:
+      type: object
+      properties:
+        instrument_uid: {type: string}
+        last_attempt_at: {type: string, nullable: true}
+        last_error: {type: string, nullable: true}
+
+  responses:
+    Unauthorized:
+      description: Tinkoff-токен не настроен — операция недоступна.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: {code: AUTHENTICATION_ERROR, message: "Загрузчик не настроен (нет TINKOFF_TOKEN?)."}
+
+    TinkoffUnavailable:
+      description: Tinkoff Invest API временно недоступен.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: {code: TINKOFF_UNAVAILABLE, message: Tinkoff Invest API временно недоступен.}
+
+    InstrumentReadBadRequest:
+      description: Неверный тип инструмента, интервал, диапазон, лимит, snapshot или продолжение страницы.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/InstrumentReadError"
+          examples:
+            invalid_interval:
+              value:
+                error: {code: INVALID_INTERVAL, message: "Неподдерживаемый таймфрейм '2h'. Доступные: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w, 1M"}
+            invalid_range:
+              value:
+                error: {code: INVALID_TIME_RANGE, message: "from должен быть раньше, чем to (from=2024-02-01 00:00:00, to=2024-01-01 00:00:00)"}
+            invalid_limit:
+              value:
+                error: {code: INVALID_PAGE_LIMIT, message: "limit должен быть от 1 до 200000."}
+            invalid_cursor:
+              value:
+                error: {code: INVALID_CURSOR, message: "Продолжение страницы непригодно; начните просмотр заново."}
+            invalid_snapshot:
+              value:
+                error: {code: INVALID_SNAPSHOT, message: "Снимок чтения недоступен или относится к другому набору данных."}
+
+    InstrumentReadNotFound:
+      description: В поддерживаемом каталоге нет инструмента с такой парой типа и тикера; отличается от найденного инструмента без свечей.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/InstrumentReadError"
+          example:
+            error: {code: INSTRUMENT_NOT_FOUND, message: "Акция с тикером 'UNKNOWN' не найдена."}
+
+    InstrumentReadAmbiguous:
+      description: Каталог не обеспечивает однозначность пары типа и тикера; сервис не выбирает произвольную запись и не требует UID от клиента.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/InstrumentReadError"
+          example:
+            error: {code: AMBIGUOUS_INSTRUMENT, message: "Невозможно однозначно определить инструмент по типу и тикеру; каталог требует уточнения."}
+
+    InstrumentReadMetadataPending:
+      description: Публичная пара типа и тикера известна, но метаданные временно недоступны; клиент не синхронизирует их вручную.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/InstrumentReadError"
+          example:
+            error: {code: INSTRUMENT_METADATA_PENDING, message: "Метаданные акции SBER временно недоступны."}
+
+    DownloadTargetNotFound:
+      description: После разрешения цели через каталог/поставщика инструмент не найден. Пустой локальный кэш не является основанием для ошибки.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/DownloadError"
+          example:
+            error: {code: INSTRUMENT_NOT_FOUND, message: "Акция с тикером 'UNKNOWN' не найдена."}
+
+    DownloadTargetConflict:
+      description: Тикер неоднозначен, период полностью недоступен или серия не содержит подходящих инструментов. Клиенту не предлагается управлять внутренним каталогом.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/DownloadError"
+          examples:
+            ambiguous:
+              value:
+                error: {code: AMBIGUOUS_INSTRUMENT, message: "Невозможно однозначно определить инструмент по типу и тикеру; каталог требует уточнения."}
+            period:
+              value:
+                error: {code: PERIOD_NOT_AVAILABLE, message: "Запрошенный период не пересекается с доступной историей инструмента."}
+            series:
+              value:
+                error: {code: NO_MATCHING_INSTRUMENTS, message: "Не найдены фьючерсы серии NG, торговое окно которых пересекается с периодом."}
+
+    DownloadMetadataUnavailable:
+      description: Недостаточно метаданных для надёжного определения окна; клиент не вычисляет его самостоятельно.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/DownloadError"
+          example:
+            error: {code: METADATA_UNAVAILABLE, message: "Временно невозможно определить торговое окно инструмента."}
+
+    DownloadServiceUnavailable:
+      description: Исполнитель загрузки временно недоступен; работа не принята.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/DownloadError"
+          example:
+            error: {code: DOWNLOAD_UNAVAILABLE, message: "Сервис загрузки временно недоступен."}
+
+    DownloadPageInvalid:
+      description: Неверный фильтр, лимит или непригодное значение продолжения страницы.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/DownloadError"
+          examples:
+            cursor:
+              value:
+                error: {code: INVALID_CURSOR, message: "Продолжение страницы недоступно; начните просмотр с первой страницы."}
+            limit:
+              value:
+                error: {code: VALIDATION_ERROR, message: "Размер страницы выходит за допустимые границы."}
+
+    DownloadNotFound:
+      description: Загрузка с таким `download_id` не найдена.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/DownloadError"
+          example:
+            error: {code: DOWNLOAD_NOT_FOUND, message: "Загрузка 'dr_xxxxxxxx' не найдена."}
+
+  parameters:
+    InstrumentTypePath:
+      name: instrument_type
+      in: path
+      required: true
+      description: Тип инструмента как часть его публичного ключа.
+      schema:
+        $ref: "#/components/schemas/InstrumentType"
+      example: share
+    TickerPath:
+      name: ticker
+      in: path
+      required: true
+      description: Тикер в канонической форме каталога; передаётся как URL-кодированный сегмент.
+      schema:
+        $ref: "#/components/schemas/PublicTicker"
+      example: SBER
+    ReadSnapshot:
+      name: snapshot
+      in: query
+      required: false
+      description: Полученная от сервера непрозрачная строка. Без неё создаётся новый снимок; внутренние поколения market-import сюда не передаются.
+      schema:
+        $ref: "#/components/schemas/ReadSnapshotToken"
+      example: opaque-read-snapshot

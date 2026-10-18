@@ -1,0 +1,359 @@
+# Historical Broker API Emulator
+
+Автономное приложение, которое скачивает исторические рыночные данные из
+реального Tinkoff Invest API, хранит их в локальной SQLite-базе и отдаёт через
+локальный HTTP API, контракт которого совместим с существующим торговым роботом
+(`../My_roBot`).
+
+Эмулятор **не** изменяет торгового робота. Робот воспринимает этот проект только
+как источник данных с той же семантикой свечей и инструментов, которой он уже
+пользуется.
+
+Целевой контракт чтения переходит к инструменту по типу и тикеру, с вложенными
+свечами и покрытием. Он описан в
+[`docs/instrument-resource-api-design.md`](docs/instrument-resource-api-design.md)
+и [`docs/openapi.yaml`](docs/openapi.yaml) со статусом planned. Введение новой
+формы потребует согласованной миграции сервера и клиента робота; текущий
+работающий API описан ниже и в `API_CONNECTION.md`.
+
+```
+Tinkoff Invest API
+        ↓
+загрузчик исторических данных
+        ↓
+локальное SQLite-хранилище
+        ↓
+локальный совместимый HTTP API
+```
+
+## Поддерживаемые интервалы
+
+Ровно девять таймфреймов, которые использует робот
+(`1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w, 1M`). Свечи хранятся по каждому интервалу
+как получены — никакой агрегации таймфреймов не выполняется.
+
+## Установка
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e ".[dev]"
+```
+
+Проект зависит от Invest SDK `t_tech`. Если ваше окружение не находит
+`t-tech-investments` в PyPI, используйте индекс пакетов Tinkoff:
+
+```bash
+.venv/bin/pip install -e ".[dev]" \
+  --extra-index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple
+```
+
+## Конфигурация
+
+Секреты никогда не захардкожены. Создайте файл `.env` из шаблона и укажите токен:
+
+```bash
+cp .env .env
+# отредактируйте .env и укажите TINKOFF_TOKEN=...
+```
+
+`.env.example` документирует поддерживаемые настройки: `TINKOFF_TOKEN`,
+`HISTORICAL_BROKER_HOST`, `HISTORICAL_BROKER_PORT`, `HISTORICAL_BROKER_DB_PATH`,
+`HISTORICAL_BROKER_LOG_LEVEL`.
+
+### Импорт текущих данных My Robot
+
+Эмулятор может в фоне читать журнал завершённых свечей и состояний интервалов
+из My Robot. Настройте экспорт в My Robot, затем задайте в окружении эмулятора:
+
+```text
+HISTORICAL_BROKER_IMPORT_ENABLED=true
+HISTORICAL_BROKER_IMPORT_URL=http://127.0.0.1:8101
+HISTORICAL_BROKER_IMPORT_TOKEN=<значение MARKET_DATA_EXPORT_TOKEN в My Robot>
+HISTORICAL_BROKER_IMPORT_CONSUMER_ID=historical-emulator
+HISTORICAL_BROKER_IMPORT_POLL_SECONDS=60
+HISTORICAL_BROKER_IMPORT_TIMEOUT_SECONDS=10
+```
+
+При запуске сервер сразу начинает догонять журнал в фоне. После достижения
+конца проверяет новые изменения раз в 60 секунд. `TINKOFF_TOKEN` нужен
+эмулятору для отдельной дозагрузки истории и карточек новых UID; импорт свечей
+работает и без него, а отсутствие карточек видно в состоянии импорта.
+
+`GET /api/v1/market-import/status` показывает курсор, отставание и ошибки.
+`GET /api/v1/market-import/intervals` и `/conflicts` позволяют посмотреть
+состояния покрытия и расхождения для UID и таймфрейма.
+`GET /api/v1/market-import/missing-instruments` показывает карточки в ожидании
+и ошибки их дозагрузки.
+`POST /api/v1/market-import/sync` остаётся диагностикой импорта и возвращает
+его внутреннее `snapshot_generation`. Публичное чтение не принимает это число:
+`GET /api/v1/instruments` создаёт непрозрачный `snapshot`, который затем
+передаётся в карточку, свечи, coverage и батч. Интеграция этого шага в My_Robot
+выполняется отдельно.
+
+#### Расписания торгов
+
+Вместе со свечами эмулятор читает отдельную ленту расписаний My Robot
+(`/api/v1/market-data/trading-schedules`, свой курсор и своё подтверждение).
+Настройки те же, что у импорта свечей. Если робот ленту не публикует (404),
+свечной импорт продолжается, а состояние расписаний — `unsupported`.
+
+Исторический режим робота получает расписание через
+`GET /api/v1/trading-schedules?instrument_id=<uid>&from=…&to=…&snapshot_generation=<n>`:
+дни режима торгов инструмента на торговые даты МСК и `missing_dates` для дат
+без расписания. `snapshot_generation` из `POST /api/v1/market-import/sync`
+берётся из общего счётчика свечей и расписаний и закрепляет обе ленты.
+Расписания прошлого брокер не отдаёт: в ленте они есть только с момента, когда
+робот начал их записывать. Состояние ленты видно в поле `schedules` статуса импорта.
+
+Для прошедших дат эмулятор восстанавливает расписание по правилам сессий
+(`config/schedule_rules/<режим>.toml`: версия, периоды, окна по МСК, шаблоны
+отдельных дней недели, исключения дат и привязки `class_code`/`instrument_type` →
+режим):
+
+```bash
+historical-broker reconstruct-schedules --exchange forts_futures_weekend --from 2025-01-01 --to 2026-10-12 --dry-run
+```
+
+Минутные бары контрактов режима решают только, торговый ли день; окна берутся
+из правил. Отчёт перечисляет праздники, неполные дни, бары вне окон, окна без
+баров и помесячно первый/последний бар — по нему уточняются периоды правил.
+Без `--dry-run` все дни и привязки пишутся одной транзакцией в новом поколении;
+повтор с теми же правилами ничего не добавляет, изменённые правила требуют новой
+`version`. День и привязка из ленты всегда главнее восстановленных: в ответе
+`provenance` равен `my_robot_export` или `reconstructed` (у таких дней есть
+`rules_version`, `source=emulator-reconstructed`), `binding_provenance` — то же
+для привязки.
+
+Подробный порядок и правила расхождений описаны в
+[проекте интеграции](docs/market-data-export-integration.md).
+
+## Инициализация базы данных
+
+Инициализация выполняется автоматически при первом использовании. Чтобы создать
+базу данных явно:
+
+```bash
+.venv/bin/historical-broker init --db ./data/historical.db
+```
+
+По умолчанию база хранится в `./data/historical.db` (переопределяется через
+`--db` или `HISTORICAL_BROKER_DB_PATH`).
+
+База схемы 2 обновляется до схемы 4 на месте. Перед этапами миграции создаются
+копии `<имя базы>.pre-v3.bak` и, при переходе 3 → 4, `<имя базы>.pre-v4.bak`.
+Переход 6 → 7 (общий счётчик поколений и таблицы расписаний) создаёт
+`<имя базы>.pre-v7.bak`.
+Более старые несовместимые схемы требуют отдельного восстановления или явного
+сброса:
+
+```bash
+.venv/bin/historical-broker init --reset-db          # пересоздать с нуля
+```
+
+Флаг `--reset-db` удаляет файл базы и его `-wal`/`-shm`. После импорта в БД
+хранятся версии, которые нельзя гарантированно восстановить у брокера. Если
+архив импорта непуст, сброс требует также `--allow-import-loss`; сначала
+сохраните копию БД.
+
+## Скачивание исторических данных
+
+Сначала синхронизируйте метаданные инструмента, затем скачайте свечи. Поиск
+инструмента использует ту же связку «тикер + тип инструмента», что и робот
+(`share` | `future` | `etf` | `currency`), с проверкой по дневным свечам за
+последние 30 дней.
+
+```bash
+# синхронизировать один инструмент (требуется токен)
+.venv/bin/historical-broker instrument sync --ticker SBER --type share --db ./data/historical.db
+
+# скачать дневные свечи за последний год
+.venv/bin/historical-broker history download \
+  --instrument-id <tinkoff-uid> \
+  --interval 1d \
+  --from 2024-01-01 \
+  --to 2024-12-31 \
+  --db ./data/historical.db
+```
+
+Или скачать по тикеру (разрешается из синхронизированного каталога):
+
+```bash
+.venv/bin/historical-broker history download \
+  --ticker SBER --type share --interval 1h \
+  --from "2024-01-01 00:00" --to "2024-12-31 23:59"
+```
+
+Полезные команды CLI:
+
+```bash
+.venv/bin/historical-broker instrument sync-catalogue --type share   # весь каталог
+.venv/bin/historical-broker instrument list --ticker SBER            # сохранённые инструменты
+```
+
+## Запуск API
+
+```bash
+.venv/bin/historical-broker serve --host 127.0.0.1 --port 8100
+```
+
+Интерактивная документация API доступна на http://127.0.0.1:8100/docs
+(Swagger использует проверенный контракт `docs/openapi.yaml`, доступный через
+`/openapi.json`).
+
+### Отчёт качества истории
+
+`POST /api/v1/history/data-quality/report` проверяет историю офлайн по типу,
+тикеру, таймфрейму и диапазону на едином `snapshot`: наличие свечей, закрытый
+прогрев, корректность OHLC/объёма/времени и наблюдаемые паузы. Возвращаются
+агрегаты и ограниченные примеры, без выгрузки свечного ряда роботу.
+
+Паузы не объявляются потерями данных: без календаря полнота остаётся `unknown`.
+Контракт `/coverage` сохраняется. Запрос, статусы, ограничения и пример curl —
+в [документации отчёта](docs/history-data-quality-report.md); интерактивные
+примеры доступны в разделе **data-quality** Swagger.
+
+## Получение свечей
+
+Получите сохранённые свечи для инструмента и интервала (границы диапазона —
+наивное UTC):
+
+```bash
+curl "http://127.0.0.1:8100/api/v1/instruments/share/SBER/candles?interval=1h" \
+  -G \
+  --data-urlencode "from=2024-01-01T00:00:00" \
+  --data-urlencode "to=2024-12-31T00:00:00"
+```
+
+Строки ответа точно соответствуют свечному контракту робота:
+
+```json
+{
+  "instrument_type": "share",
+  "ticker": "SBER",
+  "interval": "1h",
+  "range": {"from": "2024-01-01 00:00:00", "to": "2024-12-31 00:00:00"},
+  "snapshot": "opaque-read-snapshot",
+  "count": 2,
+  "total": 17520,
+  "next_cursor": "opaque-candles-token",
+  "candles": [
+    {"datetime": "2024-01-01 00:00:00", "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1000},
+    {"datetime": "2024-01-01 01:00:00", "open": 100.5, "high": 102.0, "low": 100.0, "close": 101.0, "volume": 2000}
+  ]
+}
+```
+
+- `datetime` — это **наивный UTC** timestamp, формат `YYYY-MM-DD HH:MM:SS`
+  (тот же формат, в котором робот пишет свои CSV-снапшоты).
+- `open/high/low/close` — JSON-числа (float), `volume` — целое число.
+- Строки упорядочены по `datetime` по возрастанию.
+- `next_cursor` непрозрачен. Чтобы прочитать диапазон целиком, следуйте
+  `_links.next`, пока ссылка не исчезнет.
+- `total` считается только при заданных `from`/`to`; без них это `null`,
+  потому что подсчёт означал бы полное сканирование таблицы.
+
+### Остальные эндпоинты
+
+| Эндпоинт | Описание |
+| -------- | -------- |
+| `GET /health` | Проверка живости |
+| `GET /api/v1/instruments?api_version=2` | Каталог по типу и тикеру, снимок и ссылки |
+| `GET /api/v1/instruments/{instrument_type}/{ticker}` | Карточка инструмента |
+| `GET /api/v1/instruments/{instrument_type}/{ticker}/candles` | Сохранённые свечи, постранично по ссылкам |
+| `GET /api/v1/instruments/{instrument_type}/{ticker}/coverage` | Доступность сохранённой истории |
+| `POST /api/v1/instruments/candles/batch` | Свечи нескольких инструментов в одном снимке |
+| `/api/v1/history/downloads*` | Предпросмотр, фоновая загрузка, журнал и отчёты |
+
+Без `api_version=2` каталог возвращает Tinkoff-совместимый UID-массив для
+текущего My_roBot; UID-маршруты сохраняют этот контракт без изменений.
+
+Ошибки используют стабильную JSON-форму:
+
+```json
+{"error": {"code": "INSTRUMENT_NOT_FOUND", "message": "…"}}
+```
+
+Коды: `INSTRUMENT_NOT_FOUND` (404), `INVALID_INTERVAL` (400),
+`INVALID_TIME_RANGE` (400), `INVALID_PAGE_LIMIT` (400),
+`HISTORY_NOT_AVAILABLE` (404), `TINKOFF_UNAVAILABLE`
+(502), `AUTHENTICATION_ERROR` (401), `TINKOFF_REQUEST_ERROR` (400),
+`VALIDATION_ERROR` (400), `INTERNAL_ERROR` (500).
+
+## Локальная/офлайн-работа
+
+После скачивания данных чтение сохранённой истории и работа API **не**
+обращаются к Tinkoff и **не** требуют токена. Сервер запускается даже без
+`TINKOFF_TOKEN`:
+
+- чтение/запись свечей и инструментов работает офлайн;
+- скачивание из Tinkoff через CLI требует настроенный `TINKOFF_TOKEN`.
+
+База — это один SQLite-файл (по умолчанию `./data/historical.db`) с таблицами
+`instruments`, `candles` и `download_jobs`. Свечи дедуплицируются по
+`(instrument_id, interval, ts)`; повторное скачивание того же диапазона
+идемпотентно.
+
+### Загрузка истории
+
+Старые HTTP-эндпоинты `download` и `jobs*` удалены. Единственный проектируемый
+публичный интерфейс загрузки — `/api/v1/history/downloads*`: создание загрузки,
+журнал, статус, результаты, отчёт, отмена и повтор. Он пока не реализован;
+сейчас данные загружаются через CLI `historical-broker history download`.
+
+`DownloadJobStore` остаётся внутренним Python-сервисом фонового выполнения.
+Будущий фасад обращается к его методам напрямую, без HTTP; внутренние задачи
+не публикуются как отдельные ресурсы.
+
+Контракт и статус каждой операции — в [`docs/openapi.yaml`](docs/openapi.yaml),
+обоснование — в
+[`docs/futures-backfill-service-design.md`](docs/futures-backfill-service-design.md).
+
+## Разработка
+
+```bash
+.venv/bin/python -m pytest        # запуск набора тестов
+.venv/bin/python -m ruff check .  # линт
+```
+
+Совместимость контракта рыночных данных с роботом описана в
+[`docs/existing_robot_api_analysis.md`](docs/existing_robot_api_analysis.md) и
+[`COMPATIBILITY.md`](COMPATIBILITY.md).
+
+## Автономный дистрибутив
+
+Дистрибутив для пользователя (без Python) собирается через PyInstaller из
+воспроизводимого конфига
+[`historical_broker_api_emulator.spec`](historical_broker_api_emulator.spec):
+
+```bash
+.venv/bin/python scripts/build_distribution.py
+```
+
+Сборка полностью управляется
+[`scripts/build_distribution.py`](scripts/build_distribution.py): версия читается
+из единого источника `src.__version__` (SemVer), на выходе получается
+
+```text
+dist/historical-broker-api-emulator-v<version>/
+├── historical-broker-api-emulator       # (.exe на Windows)
+├── config/  data/  logs/                # заглушки рантайма (данные живут в каталоге пользователя)
+├── .env.example
+├── README.txt
+├── API_CONNECTION.md
+├── COMPATIBILITY.md
+└── VERSION.txt
+```
+
+Упакованное приложение никогда не зависит от текущей рабочей директории: без
+токена оно запускается офлайн и обслуживает read-only эндпоинты; данные (SQLite,
+логи, `.env`) хранятся в каталоге пользовательских данных приложения (или рядом
+с исполняемым файлом в portable-режиме — см. `README.txt` в дистрибутиве).
+
+## Документация
+
+- [`API_CONNECTION.md`](API_CONNECTION.md) — как подключиться к API (эндпоинты,
+  форматы, коды ошибок, примеры, Python-клиент).
+- [`VERIFICATION.md`](VERIFICATION.md) — результаты реальной самопроверки
+  запущенного сервера.
+- [`scripts/dist/README.txt`](scripts/dist/README.txt) — пользовательская
+  инструкция, входящая в состав автономного дистрибутива.

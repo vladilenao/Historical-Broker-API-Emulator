@@ -1,0 +1,168 @@
+--- a/src/api/emulator_client.py
++++ b/src/api/emulator_client.py
+@@ -148,9 +148,13 @@
+     свечей и поиск инструмента работают без изменений.
+     """
+ 
+-    def __init__(self, base_url: str | None = None, *, timeout: float = 60.0) -> None:
++    def __init__(
++        self, base_url: str | None = None, *, timeout: float = 60.0,
++        snapshot_generation: int | None = None,
++    ) -> None:
+         self._base_url = (base_url or HISTORICAL_API_URL).rstrip("/")
+         self._timeout = timeout
++        self._snapshot_generation = snapshot_generation
+         self.instruments = HistoricalInstruments(self)
+         self._closed = False
+ 
+@@ -172,6 +176,27 @@
+     def ping(self) -> dict:
+         """Проверка живости источника: ``GET /health``."""
+         return self._get("/health")
++
++    def sync_market_data(self) -> dict:
++        """Зафиксировать импорт перед прогоном и вернуть номер снимка."""
++        url = f"{self._base_url}/api/v1/market-import/sync"
++        try:
++            post = request.Request(url, data=b"", method="POST")
++            with request.urlopen(post, timeout=self._timeout) as response:
++                result = json.load(response)
++        except HTTPError as exc:
++            raise self._error(exc) from exc
++        except urlerror.URLError as exc:
++            raise EmulatorError("SOURCE_UNAVAILABLE", f"Эмулятор недоступен: {exc.reason}") from exc
++        except TimeoutError as exc:
++            raise EmulatorError(
++                "SOURCE_TIMEOUT", f"Эмулятор не ответил за {self._timeout:g}s"
++            ) from exc
++        except ValueError as exc:
++            raise EmulatorError("INVALID_RESPONSE", "Эмулятор вернул некорректный JSON") from exc
++        if not isinstance(result, dict):
++            raise EmulatorError("INVALID_RESPONSE", "Эмулятор не вернул объект JSON")
++        return result
+ 
+     def get_all_candles(
+         self,
+@@ -195,6 +220,8 @@
+             "interval": self._interval(interval),
+             "limit": _CANDLES_PAGE_LIMIT,
+         }
++        if self._snapshot_generation is not None:
++            params["snapshot_generation"] = self._snapshot_generation
+         if from_ is not None:
+             params["from"] = _bounds(from_)
+         if to is not None:
+@@ -322,9 +349,12 @@
+ 
+     def _error(self, exc: HTTPError) -> EmulatorError:
+         try:
+-            detail = json.loads(exc.read().decode("utf-8")).get("error", {})
++            body = json.loads(exc.read().decode("utf-8"))
++            detail = body.get("error") or body.get("detail") or {}
+         except Exception:  # noqa: BLE001 — тело ошибки может быть любым
+             detail = {}
++        if isinstance(detail, str):
++            return EmulatorError("MARKET_IMPORT_FAILED", detail, exc.code)
+         return EmulatorError(
+             detail.get("code", "INTERNAL_ERROR"),
+             detail.get("message", exc.reason or "запрос отклонён"),
+@@ -338,10 +368,24 @@
+     def __init__(self, base_url: str | None = None, *, timeout: float = 60.0) -> None:
+         self._base_url = base_url or HISTORICAL_API_URL
+         self._timeout = timeout
++        self._snapshot_generation: int | None = None
+ 
+     @property
+     def base_url(self) -> str:
+         return self._base_url
+ 
+     def client_context(self, token=None) -> HistoricalClient:
+-        return HistoricalClient(self._base_url, timeout=self._timeout)
++        return HistoricalClient(
++            self._base_url, timeout=self._timeout,
++            snapshot_generation=self._snapshot_generation,
++        )
++
++    def prepare_snapshot(self) -> dict:
++        """Выполнить внеочередной импорт один раз перед историческим прогоном."""
++        with self.client_context() as client:
++            result = client.sync_market_data()
++        generation = result.get("snapshot_generation")
++        if type(generation) is not int or generation < 0 or result.get("synchronized") is not True:
++            raise EmulatorError("IMPORT_INCOMPLETE", "Эмулятор не подтвердил снимок данных My Robot")
++        self._snapshot_generation = generation
++        return result
+--- a/run.py
++++ b/run.py
+@@ -55,7 +55,7 @@
+     run_dir_name,
+     HIST_DIR,
+ )
+-from src.api.emulator_client import EmulatorClientProvider
++from src.api.emulator_client import EmulatorClientProvider, EmulatorError
+ from src.bot.run_session import build_run_session
+ from src.data.timeutil import to_aware_utc, to_naive
+ from src.history.preflight import active_pairs, run_preflight, smallest_period
+@@ -243,13 +243,25 @@
+     выбранные инструменты передаются в повтор, чтобы пользователя не спрашивали
+     второй раз. Повтор ровно один — границы для нового начала проверены.
+     """
++    provider = EmulatorClientProvider()
++    prepare_snapshot = getattr(provider, "prepare_snapshot", None)
++    if prepare_snapshot is not None:
++        try:
++            sync = prepare_snapshot()
++        except EmulatorError as exc:
++            print(f"Импорт My Robot перед прогоном не подтверждён: {exc}")
++        else:
++            print(
++                "Снимок рыночных данных My Robot: "
++                f"{sync['snapshot_generation']} (курсор {sync['after_id']})."
++            )
+     instruments = None
+     for _ in range(2):
+         clock = HistoricalClock(start, end, smallest_period(_timeframes()), pause)
+         state_dir = state_dir_for(start, end)
+         code, shifted, instruments = _launch(
+             state_dir=state_dir,
+-            client_provider=EmulatorClientProvider(),
++            client_provider=provider,
+             clock=clock,
+             session=build_run_session(MODE_HISTORY, clock),
+             channel_names=[],
+--- a/tests/unit/test_emulator_client.py
++++ b/tests/unit/test_emulator_client.py
+@@ -64,6 +64,33 @@
+     return HTTPError("http://emulator:8100/x", status, "err", {}, io.BytesIO(payload))
+ 
+ 
++def test_historical_provider_uses_one_preflight_snapshot_for_candle_pages():
++    calls = []
++
++    def respond(url, timeout=None):
++        calls.append(url)
++        if hasattr(url, "get_method"):
++            assert url.get_method() == "POST"
++            assert url.full_url.endswith("/api/v1/market-import/sync")
++            return _Response({
++                "synchronized": True, "snapshot_generation": 7,
++                "after_id": 12,
++            })
++        return _Response({"candles": [], "total": 0, "next_cursor": None})
++
++    with patch("src.api.emulator_client.request.urlopen", respond):
++        provider = EmulatorClientProvider("http://emulator:8100")
++        assert provider.prepare_snapshot()["snapshot_generation"] == 7
++        list(provider.client_context().get_all_candles(
++            from_=datetime(2024, 1, 1, tzinfo=timezone.utc),
++            interval=CandleInterval.CANDLE_INTERVAL_1_MIN,
++            instrument_id="uid-1",
++        ))
++
++    assert len(calls) == 2
++    assert "snapshot_generation=7" in calls[1]
++
++
+ class TestQuotationConversion:
+     def test_integer_price(self):
+         assert _quotation(100.0) == schemas.Quotation(units=100, nano=0)

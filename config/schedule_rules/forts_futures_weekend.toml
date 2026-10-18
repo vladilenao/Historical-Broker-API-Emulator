@@ -1,0 +1,299 @@
+# Правила сессий режима forts_futures_weekend (срочный рынок МосБиржи).
+#
+# Окна — по МСК (UTC+3 без перехода на летнее время), конец включительно, как
+# у брокера. Окна берутся отсюда, а не подгоняются по барам: бары только
+# решают, торговый ли день, и проверяют правила (отчёт reconstruct-schedules).
+#
+# Периоды установлены по минутным свечам SPBFUT (BR, Si, NG, …) в базе
+# эмулятора; помесячная таблица первого/последнего бара в отчёте генератора —
+# основание для каждой границы. Дневной клиринг 14:00–14:05 брокер в
+# расписании не показывает, поэтому его нет и здесь: робот ведёт клиринг по
+# [trading].clearing_times.
+#
+# Любое изменение файла требует новой версии: генератор отказывается писать
+# дни под версией, уже закреплённой за другим содержимым.
+#
+# История версий:
+#   /1 — 2025-01-01 и позже;
+#   /2 — добавлены периоды с 2020-11-01 и шаблоны по дням недели. Раньше
+#        ноября 2020 минутки в базе редкие, а 14.09–19.10.2020 их нет совсем:
+#        будни без баров там выглядели бы праздниками.
+
+exchange = "forts_futures_weekend"
+version = "forts_futures_weekend/2"
+utc_offset_hours = 3
+
+# Инструменты без импортированной привязки получают восстановленную по
+# class_code + instrument_type. Импортированная привязка всегда главнее.
+[[bindings]]
+class_code = "SPBFUT"
+instrument_type = "future"
+
+[detection]
+# Неторговой дата объявляется, только если в её окрестности есть данные хотя
+# бы у стольких контрактов режима.
+min_reference_instruments = 3
+# Контракт с таким числом баров в соседние торговые даты, почти без баров в
+# саму дату, — дыра в данных этого контракта (пометка в отчёте).
+liquid_bars = 300
+# Допуск первого/последнего бара дня относительно окон правил.
+edge_tolerance_minutes = 15
+
+# --- Шаблоны дня ------------------------------------------------------------
+
+# 2020-11 — 2021-02: основная 10:00–18:45, вечерний клиринг 18:45–19:00,
+# вечерняя 19:00–23:50. Аукциона открытия по барам нет (первый бар 10:00).
+[templates.classic_1000]
+intervals = [
+  { type = "regular_trading_session_main", generic = "regular_trading_session", start = "10:00:00", end = "18:44:59" },
+  { type = "regular_trading_session_evening", generic = "regular_trading_session", start = "19:00:00", end = "23:50:00" },
+]
+
+# По средам и четвергам до 02.2022 баров 19:00–19:04 нет ни разу (0 из 68
+# сред, 0 из 65 четвергов), вечерняя сессия начиналась в 19:05.
+[templates.classic_1000_late_evening]
+intervals = [
+  { type = "regular_trading_session_main", generic = "regular_trading_session", start = "10:00:00", end = "18:44:59" },
+  { type = "regular_trading_session_evening", generic = "regular_trading_session", start = "19:05:00", end = "23:50:00" },
+]
+
+# Предпраздничный день без вечерней сессии.
+[templates.classic_1000_no_evening]
+intervals = [
+  { type = "regular_trading_session_main", generic = "regular_trading_session", start = "10:00:00", end = "18:44:59" },
+]
+
+# С 01.03.2021: утренняя сессия с 07:00 без перерыва до основной.
+[templates.morning_0700_classic]
+intervals = [
+  { type = "regular_trading_session_morning", generic = "regular_trading_session", start = "07:00:00", end = "09:59:59" },
+  { type = "regular_trading_session_main", generic = "regular_trading_session", start = "10:00:00", end = "18:44:59" },
+  { type = "regular_trading_session_evening", generic = "regular_trading_session", start = "19:00:00", end = "23:50:00" },
+]
+
+[templates.morning_0700_classic_late_evening]
+intervals = [
+  { type = "regular_trading_session_morning", generic = "regular_trading_session", start = "07:00:00", end = "09:59:59" },
+  { type = "regular_trading_session_main", generic = "regular_trading_session", start = "10:00:00", end = "18:44:59" },
+  { type = "regular_trading_session_evening", generic = "regular_trading_session", start = "19:05:00", end = "23:50:00" },
+]
+
+# 02.03.2022 — 27.05.2022: только основная сессия 10:00–18:45.
+[templates.main_1000_1845]
+intervals = [
+  { type = "regular_trading_session_main", generic = "regular_trading_session", start = "10:00:00", end = "18:44:59" },
+]
+
+# 30.05.2022 — 11.07.2022: только основная сессия 10:00–18:50.
+[templates.main_1000_1850]
+intervals = [
+  { type = "regular_trading_session_main", generic = "regular_trading_session", start = "10:00:00", end = "18:49:59" },
+]
+
+# 12.07.2022 — 09.09.2022: вернулась вечерняя сессия с 19:05; аукциона нет.
+[templates.weekday_1000_break_no_auction]
+intervals = [
+  { type = "regular_trading_session_main", generic = "regular_trading_session", start = "10:00:00", end = "18:49:59" },
+  { type = "regular_trading_session_evening", generic = "regular_trading_session", start = "19:05:00", end = "23:50:00" },
+]
+
+# 12.09.2022 — 07.07.2023: основная с 09:00, аукциона нет (бара 08:59 нет ни в один день).
+[templates.weekday_0900_break_no_auction]
+intervals = [
+  { type = "regular_trading_session_main", generic = "regular_trading_session", start = "09:00:00", end = "18:49:59" },
+  { type = "regular_trading_session_evening", generic = "regular_trading_session", start = "19:05:00", end = "23:50:00" },
+]
+
+# 13.06.2024 — 24.01.2025: аукцион 09:50, торги с 10:00, перерыв 18:50–19:05.
+[templates.weekday_1000_break]
+intervals = [
+  { type = "opening_auction_morning", generic = "opening_auction", start = "09:50:00", end = "09:59:59" },
+  { type = "regular_trading_session_main", generic = "regular_trading_session", start = "10:00:00", end = "18:49:59" },
+  { type = "regular_trading_session_evening", generic = "regular_trading_session", start = "19:05:00", end = "23:50:00" },
+]
+
+# 10.07.2023 — 11.06.2024 и с 27.01.2025: аукцион 08:50, основная с 09:00,
+# перерыв 18:50–19:05. В 09–10.2023 бара аукциона 08:59 часто нет — аукцион
+# без сделок; окно аукциона баров не требует.
+[templates.weekday_0900_break]
+intervals = [
+  { type = "opening_auction_morning", generic = "opening_auction", start = "08:50:00", end = "08:59:59" },
+  { type = "regular_trading_session_main", generic = "regular_trading_session", start = "09:00:00", end = "18:49:59" },
+  { type = "regular_trading_session_evening", generic = "regular_trading_session", start = "19:05:00", end = "23:50:00" },
+]
+
+# То же без вечерней сессии (по барам: после 18:49 торгов не было).
+[templates.weekday_0900_no_evening]
+intervals = [
+  { type = "opening_auction_morning", generic = "opening_auction", start = "08:50:00", end = "08:59:59" },
+  { type = "regular_trading_session_main", generic = "regular_trading_session", start = "09:00:00", end = "18:49:59" },
+]
+
+# С 23.03.2026: без перерыва 18:50–19:05, вечерний клиринг после 23:50.
+# Окно clearing взято из текущего расписания брокера; с какого дня брокер
+# показывал его, по свечам не установить — оно вне торгов и баров не имеет.
+[templates.weekday_0900]
+intervals = [
+  { type = "opening_auction_morning", generic = "opening_auction", start = "08:50:00", end = "08:59:59" },
+  { type = "regular_trading_session_main", generic = "regular_trading_session", start = "09:00:00", end = "18:59:59" },
+  { type = "regular_trading_session_evening", generic = "regular_trading_session", start = "19:00:00", end = "23:50:00" },
+  { type = "clearing", start = "23:50:01", end = "00:30:00", end_day = 1 },
+]
+
+# С 14.07.2026 — текущее расписание брокера: утренняя сессия с 07:00.
+[templates.weekday_0700]
+intervals = [
+  { type = "opening_auction_morning", generic = "opening_auction", start = "06:50:00", end = "06:59:59" },
+  { type = "regular_trading_session_morning", generic = "regular_trading_session", start = "07:00:00", end = "08:59:59" },
+  { type = "regular_trading_session_main", generic = "regular_trading_session", start = "09:00:00", end = "18:59:59" },
+  { type = "regular_trading_session_evening", generic = "regular_trading_session", start = "19:00:00", end = "23:50:00" },
+  { type = "clearing", start = "23:50:01", end = "00:30:00", end_day = 1 },
+]
+
+# Сессия выходного дня (с 16.08.2025).
+[templates.weekend_1000]
+intervals = [
+  { type = "holiday_opening_auction_morning", generic = "opening_auction", start = "09:50:00", end = "09:59:59" },
+  { type = "holiday_trading_session_morning", generic = "regular_trading_session", start = "10:00:00", end = "19:00:00" },
+]
+
+# Праздничный будний день 2026 года: дневная сессия как в выходной и вечерняя
+# сессия (по барам: первый бар 09:59, торги после 19:00 до 23:49).
+[templates.holiday_1000_evening]
+intervals = [
+  { type = "holiday_opening_auction_morning", generic = "opening_auction", start = "09:50:00", end = "09:59:59" },
+  { type = "holiday_trading_session_morning", generic = "regular_trading_session", start = "10:00:00", end = "18:59:59" },
+  { type = "regular_trading_session_evening", generic = "regular_trading_session", start = "19:00:00", end = "23:50:00" },
+  { type = "clearing", start = "23:50:01", end = "00:30:00", end_day = 1 },
+]
+
+# --- Периоды ----------------------------------------------------------------
+
+[[periods]]
+from = "2020-11-01"
+to = "2021-02-28"
+weekday = "classic_1000"
+by_weekday = { wednesday = "classic_1000_late_evening", thursday = "classic_1000_late_evening" }
+note = "первый бар 10:00, нет баров 18:45–18:59; вечер с 19:00 (ср, чт — с 19:05)"
+
+[[periods]]
+from = "2021-03-01"
+to = "2022-02-27"
+weekday = "morning_0700_classic"
+by_weekday = { wednesday = "morning_0700_classic_late_evening", thursday = "morning_0700_classic_late_evening" }
+note = "первый бар 07:00: утренняя сессия"
+
+[[periods]]
+from = "2022-02-28"
+to = "2022-05-29"
+weekday = "main_1000_1845"
+note = "после приостановки торгов: 10:00–18:44, вечерней сессии нет"
+
+[[periods]]
+from = "2022-05-30"
+to = "2022-07-11"
+weekday = "main_1000_1850"
+note = "последний бар 18:49, вечерней сессии нет"
+
+[[periods]]
+from = "2022-07-12"
+to = "2022-09-11"
+weekday = "weekday_1000_break_no_auction"
+note = "бары с 19:05 до 23:49"
+
+[[periods]]
+from = "2022-09-12"
+to = "2023-07-09"
+weekday = "weekday_0900_break_no_auction"
+note = "первый бар 09:00"
+
+[[periods]]
+from = "2023-07-10"
+to = "2024-06-12"
+weekday = "weekday_0900_break"
+note = "первый бар 08:59: аукцион открытия"
+
+[[periods]]
+from = "2024-06-13"
+to = "2025-01-26"
+weekday = "weekday_1000_break"
+note = "первый бар будней 09:59; выходные неторговые"
+
+[[periods]]
+from = "2025-01-27"
+to = "2025-08-15"
+weekday = "weekday_0900_break"
+note = "первый бар будней 08:59, нет баров 18:50–19:04; выходные неторговые"
+
+[[periods]]
+from = "2025-08-16"
+to = "2026-03-22"
+weekday = "weekday_0900_break"
+weekend = "weekend_1000"
+note = "сессии выходного дня: первый бар 09:59, последний 18:59"
+
+[[periods]]
+from = "2026-03-23"
+to = "2026-07-13"
+weekday = "weekday_0900"
+weekend = "weekend_1000"
+note = "бары 18:50–19:04 по будням: перерыва на вечерний клиринг нет"
+
+[[periods]]
+from = "2026-07-14"
+weekday = "weekday_0700"
+weekend = "weekend_1000"
+note = "первый бар будней 06:59: утренняя сессия"
+
+# --- Исключения отдельных дат -----------------------------------------------
+# Без баров день всё равно станет неторговым: исключение задаёт только окна.
+
+[[overrides]]
+date = "2021-02-20"
+template = "classic_1000_no_evening"
+reason = "перенесённый рабочий день (суббота), предпраздничный: последний бар 18:44"
+
+[[overrides]]
+date = "2022-02-25"
+template = "classic_1000"
+reason = "утренней сессии не было: первый бар 10:00"
+
+[[overrides]]
+date = "2024-04-27"
+template = "weekday_0900_break"
+reason = "перенесённый рабочий день: суббота торговалась по расписанию будня"
+
+[[overrides]]
+date = "2024-11-02"
+template = "weekday_1000_break"
+reason = "перенесённый рабочий день: суббота торговалась по расписанию будня"
+
+[[overrides]]
+date = "2024-12-28"
+template = "weekday_1000_break"
+reason = "перенесённый рабочий день: суббота торговалась по расписанию будня"
+
+[[overrides]]
+date = "2025-11-01"
+template = "weekday_0900_break"
+reason = "перенесённый рабочий день: суббота торговалась по расписанию будня"
+
+[[overrides]]
+date = "2026-02-23"
+template = "weekend_1000"
+reason = "праздничный день: торги по расписанию выходного дня"
+
+[[overrides]]
+date = "2026-03-20"
+template = "weekday_0900_no_evening"
+reason = "последний день старого режима: по барам вечерней сессии не было"
+
+[[overrides]]
+date = "2026-05-01"
+template = "holiday_1000_evening"
+reason = "праздничный день: дневная сессия выходного дня и вечерняя сессия"
+
+[[overrides]]
+date = "2026-06-12"
+template = "holiday_1000_evening"
+reason = "праздничный день: дневная сессия выходного дня и вечерняя сессия"

@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "emulator",
+      "runtimeExecutable": ".venv/bin/historical-broker",
+      "runtimeArgs": ["serve", "--host", "127.0.0.1", "--port", "8100"],
+      "port": 8100,
+      "url": "http://127.0.0.1:8100"
+    }
+  ]
+}
