@@ -12,8 +12,9 @@ from datetime import date, datetime, timedelta
 
 from src.cli import main
 from src.history.readiness import ERROR, OK, WARNING, check_readiness, format_readiness
-from src.models import Instrument
+from src.models import Candle, Instrument
 from src.schedules.rules import parse_rules
+from src.storage.candle_repository import CandleRepository
 from src.storage.database import open_database
 from src.storage.instrument_repository import InstrumentRepository
 from src.storage.schedule_repository import ReconstructedDayRow, ScheduleRepository
@@ -63,9 +64,24 @@ def _days(first: str, last: str, skip: tuple[str, ...] = ()) -> list[Reconstruct
     ]
 
 
-def _db(tmp_path, instruments, *, bind=True, days=None):
+def _minutes(instrument: Instrument, since: datetime | None = None) -> list[Candle]:
+    """Одна минутная свеча в 07:00 UTC каждого дня обращения контракта."""
+    day = max(instrument.first_trade_date, since or instrument.first_trade_date)
+    day = day.replace(hour=7, minute=0, second=0)
+    result = []
+    while day < instrument.last_trade_date:
+        result.append(Candle(instrument.instrument_id, "1m", day, 1.0, 2.0, 1.0, 1.5, 10))
+        day += timedelta(days=1)
+    return result
+
+
+def _db(tmp_path, instruments, *, bind=True, days=None, candles=True):
     conn = open_database(tmp_path / "readiness.db")
     InstrumentRepository(conn).upsert_many(instruments)
+    if candles:
+        CandleRepository(conn).insert_candles(
+            [candle for item in instruments for candle in _minutes(item)]
+        )
     bindings = [(item.instrument_id, FORTS) for item in instruments] if bind else []
     rows = _days("2026-09-01", "2026-10-12") if days is None else days
     ScheduleRepository(conn).write_reconstruction(
@@ -166,6 +182,43 @@ def test_today_is_not_a_missing_schedule_day(tmp_path):
                  if item.code == "SCHEDULE_DAYS_MISSING")
     assert "нет расписания на 2026-10-11 (1 дн.)" in issue.message
     assert "--to 2026-10-11" in issue.hint
+
+
+def test_history_starts_after_the_missing_predecessor(tmp_path):
+    # Шаг экспираций GOLD — месяц: предшественник GOLD-12.26 гаснет около
+    # 2026-09-08 16:00, рубеж смены на него — 2026-09-06 16:00.
+    report = _check(_db(tmp_path, _gold_chain()))
+    family = report.families[0]
+    assert family.usable_from == datetime(2026, 9, 7, 7, 0)
+    assert family.usable_note == (
+        "раньше основного контракта в каталоге нет (самый ранний — GOLD-12.26)"
+    )
+    assert family.payload()["usable_from"] == "2026-09-07 07:00:00"
+    assert ("история для прогона: с 2026-09-07 — раньше основного контракта в каталоге нет"
+            in format_readiness(report))
+
+
+def test_schedule_before_usable_history_is_not_reported(tmp_path):
+    report = _check(_db(tmp_path, _gold_chain(), days=_days("2026-09-07", "2026-10-11")))
+    assert report.status == OK
+
+
+def test_history_starts_with_minutes_of_the_front_contract(tmp_path):
+    conn = _db(tmp_path, _gold_chain(), candles=False)
+    first, second = _gold_chain()
+    CandleRepository(conn).insert_candles(_minutes(second, datetime(2026, 10, 9)))
+    family = _check(conn).families[0]
+    assert family.usable_from == datetime(2026, 10, 9, 7, 0)
+    assert family.usable_note == "первые минутные свечи основного контракта GOLD-3.27"
+
+
+def test_family_without_minutes_has_no_usable_history(tmp_path):
+    report = _check(_db(tmp_path, _gold_chain(), days=[], candles=False))
+    family = report.families[0]
+    assert family.usable_from is None
+    assert "SCHEDULE_DAYS_MISSING" not in _codes(report)
+    assert "история для прогона: нет — на участках цепочки нет минутных свечей" \
+        in format_readiness(report)
 
 
 def test_schedule_is_checked_only_on_the_chain_segment(tmp_path):

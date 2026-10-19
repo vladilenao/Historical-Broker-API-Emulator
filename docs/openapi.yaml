@@ -2457,6 +2457,14 @@ components:
                   contracts: {type: integer}
                   first_trade: {type: string, format: date, nullable: true}
                   last_expiration: {type: string, format: date, nullable: true}
+                  usable_from:
+                    type: string
+                    nullable: true
+                    description: |
+                      С какого момента (UTC, `YYYY-MM-DD HH:MM:SS`) у семейства есть
+                      основной контракт и его минутные свечи; `null` — ни с какого.
+                      Расписание раньше этого момента не проверяется.
+                  usable_note: {type: string, nullable: true, description: Почему история начинается именно с этого момента.}
                   issues:
                     type: array
                     items:

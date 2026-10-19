@@ -16,6 +16,12 @@
   ``exchange: null``) и дни режима на участке цепочки, где контракт основной:
   от рубежа предыдущего контракта (у первого — от начала торгов) до своего
   рубежа. Дата без дня — внутридневные входы робота в неё отклоняются.
+* пригодность истории — с какого момента у семейства есть основной контракт
+  и его минутные свечи (робот всегда грузит 1m для защиты позиции). Раньше
+  самого раннего контракта каталога основным был погашенный контракт, которого
+  в каталоге нет, и робот торговал бы дальним выпуском. Рубеж этого
+  предшественника оценивается по обычному шагу экспираций семейства. Расписание
+  до момента пригодности не проверяется: прогон там всё равно некорректен.
   Сегодняшняя дата МСК не проверяется: день ещё идёт, и генератор его не
   построит, пока не закончатся бары.
 
@@ -65,6 +71,9 @@ _CARD_FIELDS = (
     ("go_sell", "initial_margin_on_sell"),
 )
 _NOT_STANDARD = ("мини", "микро", "mini", "micro")
+_TS_FORMAT = "%Y-%m-%d %H:%M:%S"
+#: ``LOOKAHEAD`` предпроверки робота: столько он ищет ближайшую свечу у границы.
+_LOOKAHEAD = timedelta(days=7)
 
 
 @dataclass(frozen=True)
@@ -83,6 +92,9 @@ class FamilyReadiness:
     first_trade: date | None
     last_expiration: date | None
     issues: tuple[Issue, ...] = ()
+    #: С какого момента (наивный UTC) история пригодна для прогона; ``None`` — ни с какого.
+    usable_from: datetime | None = None
+    usable_note: str | None = None
 
     @property
     def status(self) -> str:
@@ -100,6 +112,10 @@ class FamilyReadiness:
             "last_expiration": (
                 None if self.last_expiration is None else self.last_expiration.isoformat()
             ),
+            "usable_from": (
+                None if self.usable_from is None else self.usable_from.strftime(_TS_FORMAT)
+            ),
+            "usable_note": self.usable_note,
             "issues": [
                 {
                     "severity": severity,
@@ -156,6 +172,7 @@ def check_readiness(
     if lead_days < 0:
         raise ValueError("lead_days должен быть >= 0")
     context = _Context(
+        conn=conn,
         schedules=ScheduleRepository(conn),
         generation=CandleRepository(conn).current_generation(),
         lead_days=lead_days,
@@ -218,6 +235,7 @@ def log_readiness(report: ReadinessReport) -> None:
 
 @dataclass(frozen=True)
 class _Context:
+    conn: Connection
     schedules: ScheduleRepository
     generation: int
     lead_days: int
@@ -250,7 +268,9 @@ def _check_family(code: str, instruments, context: _Context) -> FamilyReadiness:
         ))
     cards.sort(key=lambda card: (card.expiration or datetime.max, card.name))
     issues.extend(_chain_issues(cards, context.lead_days))
-    issues.extend(_schedule_issues(cards, context))
+    segments = _segments(cards)
+    usable_from, usable_note = _usable_from(cards, segments, context)
+    issues.extend(_schedule_issues(cards, segments, usable_from, context))
     starts = [card.first_trade for card in cards if card.first_trade is not None]
     ends = [card.expiration for card in cards if card.expiration is not None]
     return FamilyReadiness(
@@ -259,7 +279,61 @@ def _check_family(code: str, instruments, context: _Context) -> FamilyReadiness:
         first_trade=min(starts).date() if starts else None,
         last_expiration=max(ends).date() if ends else None,
         issues=tuple(issues),
+        usable_from=usable_from,
+        usable_note=usable_note,
     )
+
+
+def _segments(cards: list[_Card]) -> list[tuple[_Card, datetime, datetime]]:
+    """Участки цепочки: контракт основной от рубежа предыдущего до своего."""
+    result = []
+    previous_cutoff: datetime | None = None
+    for card in cards:
+        if card.first_trade is None or card.cutoff is None:
+            continue
+        start = card.first_trade if previous_cutoff is None else max(card.first_trade,
+                                                                     previous_cutoff)
+        previous_cutoff = card.cutoff
+        if start < card.cutoff:
+            result.append((card, start, card.cutoff))
+    return result
+
+
+def _usable_from(cards, segments, context: _Context) -> tuple[datetime | None, str | None]:
+    """Первый момент, когда есть основной контракт и его минутные свечи."""
+    if not segments:
+        return None, "нет ни одного участка цепочки: у карточек нет дат обращения"
+    first = segments[0][0]
+    deadlines = sorted({card.deadline for card in cards if card.deadline is not None})
+    steps = sorted(b - a for a, b in zip(deadlines, deadlines[1:], strict=False))
+    start, reason = segments[0][1], f"начало торгов {first.name}"
+    if steps:
+        # Предшественник самого раннего контракта погашен и в каталоге его нет.
+        predecessor = first.deadline - steps[len(steps) // 2]
+        estimated = predecessor - timedelta(days=context.lead_days)
+        if estimated > start:
+            start = estimated
+            reason = f"раньше основного контракта в каталоге нет (самый ранний — {first.name})"
+    skipped = False
+    for card, lower, upper in segments:
+        if upper <= start:
+            continue
+        lower = max(lower, start)
+        row = context.conn.execute(
+            "SELECT MIN(ts) FROM candles WHERE instrument_id = ? AND interval = '1m' "
+            "AND ts >= ? AND ts < ?",
+            (card.uid, lower.strftime(_TS_FORMAT), upper.strftime(_TS_FORMAT)),
+        ).fetchone()
+        if row[0] is None:
+            skipped = True
+            continue
+        candle = datetime.strptime(row[0], _TS_FORMAT)
+        # Выходные и праздники до первой свечи — норма; дольше недели
+        # (LOOKAHEAD предпроверки робота) — значит, свечей не скачано.
+        if skipped or candle - lower > _LOOKAHEAD:
+            return candle, f"первые минутные свечи основного контракта {card.name}"
+        return candle, reason
+    return None, "на участках цепочки нет минутных свечей"
 
 
 def _card_issues(code: str, name: str, instrument) -> list[Issue]:
@@ -326,31 +400,28 @@ def _chain_issues(cards: list[_Card], lead_days: int) -> list[Issue]:
     return issues
 
 
-def _schedule_issues(cards: list[_Card], context: _Context) -> list[Issue]:
+def _schedule_issues(cards, segments, usable_from, context: _Context) -> list[Issue]:
     issues: list[Issue] = []
-    segments: dict[str, list[tuple[_Card, date, date]]] = {}
-    previous_cutoff: datetime | None = None
     for card in cards:
-        binding = context.schedules.binding(card.uid, context.generation)
-        start = card.first_trade
-        if start is not None and previous_cutoff is not None:
-            start = max(start, previous_cutoff)
-        if card.cutoff is not None:
-            previous_cutoff = card.cutoff
-        if binding is None:
+        if context.schedules.binding(card.uid, context.generation) is None:
             issues.append(Issue(
                 ERROR, "NO_SCHEDULE_BINDING",
                 "нет привязки к режиму торгов: робот получит exchange: null", card.name,
                 _binding_hint(card, context),
             ))
+    if usable_from is None:
+        return issues
+    windows: dict[str, list[tuple[_Card, date, date]]] = {}
+    yesterday = _exchange_date(context.now) - timedelta(days=1)
+    for card, lower, upper in segments:
+        binding = context.schedules.binding(card.uid, context.generation)
+        if binding is None or upper <= usable_from:
             continue
-        if start is None or card.cutoff is None:
-            continue
-        first = _exchange_date(start)
-        last = min(_exchange_date(card.cutoff), _exchange_date(context.now) - timedelta(days=1))
+        first = _exchange_date(max(lower, usable_from))
+        last = min(_exchange_date(upper), yesterday)
         if first <= last:
-            segments.setdefault(binding.exchange, []).append((card, first, last))
-    for exchange, items in segments.items():
+            windows.setdefault(binding.exchange, []).append((card, first, last))
+    for exchange, items in windows.items():
         lower = min(first for _, first, _ in items)
         upper = max(last for _, _, last in items)
         known = {
@@ -486,6 +557,9 @@ def format_readiness(report: ReadinessReport, *, contracts_limit: int = 4) -> st
         lines.append(
             f"  {item.family:<5} {_STATUS_TEXT[item.status]}: контрактов {item.contracts}{period}"
         )
+        usable = "нет" if item.usable_from is None else \
+            f"с {_exchange_date(item.usable_from).isoformat()}"
+        lines.append(f"    история для прогона: {usable} — {item.usable_note}")
         for (severity, _code, message, hint), contracts in _grouped(item.issues):
             names = ", ".join(contracts[:contracts_limit])
             if len(contracts) > contracts_limit:
