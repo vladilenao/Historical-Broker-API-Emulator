@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import secrets
 import threading
 import time
@@ -19,10 +20,13 @@ from src.history.jobs import (
     STATUS_RUNNING,
     DownloadJobStore,
 )
+from src.history.readiness import check_readiness, families_of, log_readiness
 from src.models import Instrument
 from src.storage.candle_repository import CandleRepository
 from src.storage.instrument_repository import InstrumentRepository
 from src.tinkoff.downloader import TinkoffHistoricalDownloader
+
+log = logging.getLogger("hbroker.downloads")
 
 TS_FORMAT = "%Y-%m-%d %H:%M:%S"
 _ITEM_TERMINAL = {"completed", "skipped", "failed", "cancelled"}
@@ -241,6 +245,7 @@ class DownloadService:
                 if item["error_code"]
             ]
             duration = _duration(row["started_at"], row["finished_at"])
+            readiness = self._readiness(items)
             links = {
                 "self": {"href": f"/api/v1/history/downloads/{download_id}/report"},
                 "items": {"href": f"/api/v1/history/downloads/{download_id}/items"},
@@ -262,6 +267,7 @@ class DownloadService:
                 "totals": totals,
                 "error": _problem(row["error_code"], row["error_message"]),
                 "errors": errors,
+                "readiness": None if readiness is None else readiness.payload(),
                 "_links": links,
             }
 
@@ -537,8 +543,26 @@ class DownloadService:
             if all_terminal:
                 with self._lock, self._conn:
                     self._finish(download_id)
+                self._log_readiness(download_id)
                 return
             time.sleep(0.05)
+
+    def _readiness(self, items):
+        """Готовность к прогону робота семейств фьючерсов из пунктов загрузки."""
+        families = families_of(
+            self._conn, [item["instrument_id"] for item in items if item["instrument_id"]]
+        )
+        return check_readiness(self._conn, families) if families else None
+
+    def _log_readiness(self, download_id: str) -> None:
+        try:
+            with self._lock:
+                report = self._readiness(self._item_rows(download_id))
+        except Exception:  # noqa: BLE001 — проверка не должна ломать загрузку
+            log.exception("Проверка готовности после загрузки %s не выполнена", download_id)
+            return
+        if report is not None:
+            log_readiness(report)
 
     def _finish(self, download_id: str) -> None:
         row = self._must_get(download_id)

@@ -61,6 +61,14 @@ def _autobind(binder: ScheduleAutoBinder, conn) -> Callable[[list[str]], None]:
     return bind
 
 
+def prepare_catalog(conn) -> ScheduleAutoBinder:
+    """То, что сервер делает с каталогом при старте: seed-поля и автопривязка."""
+    apply_family_financials(conn)
+    binder = ScheduleAutoBinder(load_installed_rules())
+    binder.bind(conn)
+    return binder
+
+
 def build_runtime(
     db_path: str | Path | None = None,
     token: str | None = None,
@@ -82,9 +90,7 @@ def build_runtime(
     conn = connect(path)
     initialize(conn, path)
     log.info("База данных инициализирована: %s", path)
-    apply_family_financials(conn)
-    binder = ScheduleAutoBinder(load_installed_rules())
-    binder.bind(conn)
+    binder = prepare_catalog(conn)
 
     candles = CandleRepository(conn)
     instruments = InstrumentRepository(conn)

@@ -2435,6 +2435,41 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/DownloadItemError"
+        readiness:
+          type: object
+          nullable: true
+          description: |
+            Готовность семейств фьючерсов из этой загрузки к историческому
+            прогону робота — то же, что `historical-broker verify`. `null`, если
+            в загрузке нет фьючерсов семейств робота. `status=error` — робот
+            откажет прогону; `warning` — прогон пойдёт с ограничениями.
+          properties:
+            status: {type: string, enum: [ok, warning, error]}
+            snapshot_generation: {type: integer}
+            lead_days: {type: integer}
+            families:
+              type: array
+              items:
+                type: object
+                properties:
+                  family: {type: string}
+                  status: {type: string, enum: [ok, warning, error]}
+                  contracts: {type: integer}
+                  first_trade: {type: string, format: date, nullable: true}
+                  last_expiration: {type: string, format: date, nullable: true}
+                  issues:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        severity: {type: string, enum: [warning, error]}
+                        code:
+                          type: string
+                          enum: [CARD_FIELD_MISSING, CARD_FIELD_INVALID, DUPLICATE_EXPIRATION, FIRST_TRADE_AFTER_CUTOFF, CHAIN_GAP, NO_SCHEDULE_BINDING, SCHEDULE_DAYS_MISSING]
+                        contracts: {type: array, items: {type: string}}
+                        message: {type: string}
+                        hint: {type: string, nullable: true}
+            skipped_families: {type: array, items: {type: string}}
         _links:
           type: object
           additionalProperties:

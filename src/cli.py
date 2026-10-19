@@ -8,6 +8,7 @@
 * ``historical-broker instrument list``             — список сохранённых инструментов;
 * ``historical-broker history download``            — скачивание и хранение свечей;
 * ``historical-broker reconstruct-schedules``       — восстановление расписаний прошедших дат;
+* ``historical-broker verify``                      — готовность фьючерсов к прогону робота;
 * ``historical-broker serve``                       — запуск локального HTTP API.
 * ``historical-broker --version``                   — вывод версии.
 """
@@ -15,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from datetime import UTC, date, datetime
@@ -23,11 +25,18 @@ import uvicorn
 
 from src.config import APP_VERSION, HISTORICAL_BROKER_HOST, database_path
 from src.errors import EmulatorError
+from src.history.readiness import (
+    DEFAULT_LEAD_DAYS,
+    ERROR,
+    check_readiness,
+    families_of,
+    format_readiness,
+)
 from src.logging_setup import setup_logging
 from src.models import SUPPORTED_INSTRUMENT_TYPES
 from src.schedules.reconstruct import ScheduleReconstructor, format_report
 from src.schedules.rules import default_rules_path, load_rules
-from src.service import build_runtime
+from src.service import build_runtime, prepare_catalog
 from src.storage.database import open_database
 
 log = logging.getLogger("hbroker.cli")
@@ -66,6 +75,15 @@ def _require_token(runtime) -> object:
     return runtime.downloader
 
 
+def _print_readiness(conn, instrument_ids: list[str] | None = None) -> None:
+    """Итог проверки готовности после загрузки; ``None`` — все семейства."""
+    families = None if instrument_ids is None else families_of(conn, instrument_ids)
+    if families == []:
+        return
+    print()
+    print(format_readiness(check_readiness(conn, families)))
+
+
 def cmd_init(args) -> None:
     runtime = build_runtime(args.db, reset=args.reset_db, allow_import_loss=args.allow_import_loss)
     print(f"База данных инициализирована: {runtime.db_path}")
@@ -79,6 +97,7 @@ def cmd_instrument_sync(args) -> None:
         f"Синхронизирован инструмент {instrument.instrument_type} "
         f"'{instrument.ticker}' -> {instrument.instrument_id}"
     )
+    _print_readiness(runtime.connection, [instrument.instrument_id])
 
 
 def cmd_instrument_catalogue(args) -> None:
@@ -86,6 +105,8 @@ def cmd_instrument_catalogue(args) -> None:
     downloader = _require_token(runtime)
     count = downloader.sync_catalogue(args.type)
     print(f"Синхронизировано {count} инструментов типа {args.type}")
+    if args.type == "future":
+        _print_readiness(runtime.connection)
 
 
 def cmd_instrument_list(args) -> None:
@@ -126,6 +147,7 @@ def cmd_history_download(args) -> None:
         f"{from_}..{to}: получено={summary.received} "
         f"сохранено={summary.retained} добавлено={summary.new_records}"
     )
+    _print_readiness(runtime.connection, [instrument.instrument_id])
 
 
 def cmd_reconstruct_schedules(args) -> None:
@@ -143,6 +165,21 @@ def cmd_reconstruct_schedules(args) -> None:
     finally:
         conn.close()
     print(format_report(report))
+
+
+def cmd_verify(args) -> int:
+    # Как reconstruct-schedules: без токена, фоновых загрузок и HTTP-приложения.
+    conn = open_database(database_path(args.db))
+    try:
+        prepare_catalog(conn)
+        report = check_readiness(conn, args.family or None, lead_days=args.lead_days)
+    finally:
+        conn.close()
+    if args.json:
+        print(json.dumps(report.payload(), ensure_ascii=False, indent=2))
+    else:
+        print(format_readiness(report))
+    return 1 if report.status == ERROR else 0
 
 
 def cmd_serve(args) -> None:
@@ -254,6 +291,32 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     reconstruct.set_defaults(func=cmd_reconstruct_schedules)
 
+    verify = sub.add_parser(
+        "verify",
+        help="Проверить, примет ли робот фьючерсы базы для исторического прогона",
+        description=(
+            "Карточки, контрактная цепочка и расписание фьючерсов по правилам "
+            "робота. Код выхода 1, если робот откажет прогону хотя бы одного семейства."
+        ),
+    )
+    verify.add_argument(
+        "--db", default=None, help="Путь к SQLite-базе (по умолчанию: из настройки)"
+    )
+    verify.add_argument(
+        "--family",
+        action="append",
+        help="Семейство (GOLD, Si, …); можно повторять. По умолчанию все семейства робота",
+    )
+    verify.add_argument(
+        "--lead-days",
+        type=int,
+        default=DEFAULT_LEAD_DAYS,
+        help="За сколько суток до конца обращения робот меняет контракт "
+             f"(по умолчанию {DEFAULT_LEAD_DAYS}, как contract_expiry_block_days)",
+    )
+    verify.add_argument("--json", action="store_true", help="Вывести отчёт в JSON")
+    verify.set_defaults(func=cmd_verify)
+
     serve = sub.add_parser("serve", help="Запустить локальный HTTP API-сервер")
     _add_db_arg(serve)
     serve.add_argument("--host", default=HISTORICAL_BROKER_HOST)
@@ -267,8 +330,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     try:
-        args.func(args)
-        return 0
+        return args.func(args) or 0
     except (EmulatorError, ValueError, RuntimeError) as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 2

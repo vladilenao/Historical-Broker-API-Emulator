@@ -303,3 +303,59 @@ def test_running_item_left_by_previous_process_is_resumed(tmp_path):
         )
     }
     assert statuses == {"completed"}
+
+
+class _GoldDownloader(_Downloader):
+    """Серия GOLD: контракт без ГО, как погасшие контракты у Tinkoff."""
+
+    def sync_futures_series(self, base_asset):
+        self.instruments.upsert(Instrument(
+            "uid-gold", "GDZ6", "future", name="GOLD-12.26 Золото", class_code="SPBFUT",
+            min_price_increment=0.1, min_price_increment_amount=8.0,
+            first_trade_date=datetime(2026, 9, 1, 7), expiration_date=datetime(2026, 10, 10),
+            last_trade_date=datetime(2026, 10, 9, 16),
+        ))
+        return 1
+
+
+def test_futures_download_report_tells_whether_robot_accepts_family(tmp_path, caplog):
+    conn = open_database(tmp_path / "gold.db")
+    candles = CandleRepository(conn)
+    instruments = InstrumentRepository(conn)
+    downloader = _GoldDownloader(candles, instruments)
+    jobs = DownloadJobStore(conn, downloader, max_workers=1)
+    service = DownloadService(conn, instruments, candles, downloader, jobs)
+    client = TestClient(create_app(ApiDeps(
+        candles=candles, instruments=instruments, downloader=downloader, jobs=jobs,
+        downloads=service,
+    )))
+    created = client.post("/api/v1/history/downloads", json={
+        "target": {"instrument_type": "future", "base_asset": "GOLD"},
+        "range": {"from": "2026-09-01", "to": "2026-10-10"},
+        "intervals": ["1d"],
+    })
+    download_id = created.json()["download_id"]
+    with caplog.at_level("WARNING", logger="hbroker.readiness"):
+        for _ in range(40):
+            jobs.wait(timeout=1)
+            if client.get(f"/api/v1/history/downloads/{download_id}").json()["status"] \
+                    == "completed" and caplog.records:
+                break
+            time.sleep(0.05)
+    readiness = client.get(f"/api/v1/history/downloads/{download_id}/report").json()["readiness"]
+    assert readiness["status"] == "error"
+    family = readiness["families"][0]
+    assert family["family"] == "GOLD"
+    codes = {issue["code"] for issue in family["issues"]}
+    assert {"CARD_FIELD_MISSING", "NO_SCHEDULE_BINDING"} <= codes
+    assert any("робот откажет прогону семейств GOLD" in record.getMessage()
+               for record in caplog.records)
+
+
+def test_share_download_report_has_no_readiness(tmp_path):
+    conn = open_database(tmp_path / "share.db")
+    candles = CandleRepository(conn)
+    instruments = InstrumentRepository(conn)
+    instruments.upsert(Instrument("uid-sber", "SBER", "share"))
+    service = DownloadService(conn, instruments, candles, None, None)
+    assert service._readiness([{"instrument_id": "uid-sber"}]) is None
