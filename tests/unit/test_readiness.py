@@ -155,6 +155,19 @@ def test_missing_schedule_days_are_a_warning_with_command(tmp_path):
     assert "даты 2026-09-10 (1 дн.) вне [[periods]]" in hint
 
 
+def test_today_is_not_a_missing_schedule_day(tmp_path):
+    # NOW — 2026-10-12: день ещё идёт, генератор его не построит.
+    report = _check(_db(tmp_path, _gold_chain(), days=_days("2026-09-01", "2026-10-11")))
+    assert report.status == OK
+    gap = tmp_path / "gap"
+    gap.mkdir()
+    report = _check(_db(gap, _gold_chain(), days=_days("2026-09-01", "2026-10-10")))
+    issue = next(item for item in report.families[0].issues
+                 if item.code == "SCHEDULE_DAYS_MISSING")
+    assert "нет расписания на 2026-10-11 (1 дн.)" in issue.message
+    assert "--to 2026-10-11" in issue.hint
+
+
 def test_schedule_is_checked_only_on_the_chain_segment(tmp_path):
     # GOLD-3.27 торгуется с 2026-09-15, но основной он только с рубежа GOLD-12.26.
     days = _days("2026-09-01", "2026-10-12", skip=("2026-09-20",))

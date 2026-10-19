@@ -16,6 +16,8 @@
   ``exchange: null``) и дни режима на участке цепочки, где контракт основной:
   от рубежа предыдущего контракта (у первого — от начала торгов) до своего
   рубежа. Дата без дня — внутридневные входы робота в неё отклоняются.
+  Сегодняшняя дата МСК не проверяется: день ещё идёт, и генератор его не
+  построит, пока не закончатся бары.
 
 Ошибка (``error``) означает, что робот откажет прогону, предупреждение
 (``warning``) — что прогон пойдёт с ограничениями. Свечи здесь не проверяются.
@@ -147,7 +149,8 @@ def check_readiness(
     """Проверяет семейства фьючерсов в базе; ``None`` — все семейства робота.
 
     ``families`` принимает коды серии в любом регистре (``Si``, ``SI``, ``GOLD``).
-    ``now`` — наивный UTC, ограничивает участок ещё торгующихся контрактов.
+    ``now`` — наивный UTC: участок ещё торгующихся контрактов проверяется по
+    вчерашнюю дату МСК включительно.
     ``rules`` — правила сессий для подсказок; по умолчанию установленные.
     """
     if lead_days < 0:
@@ -343,7 +346,8 @@ def _schedule_issues(cards: list[_Card], context: _Context) -> list[Issue]:
             continue
         if start is None or card.cutoff is None:
             continue
-        first, last = _exchange_date(start), _exchange_date(min(card.cutoff, context.now))
+        first = _exchange_date(start)
+        last = min(_exchange_date(card.cutoff), _exchange_date(context.now) - timedelta(days=1))
         if first <= last:
             segments.setdefault(binding.exchange, []).append((card, first, last))
     for exchange, items in segments.items():
