@@ -124,6 +124,10 @@ historical-broker reconstruct-schedules --exchange forts_futures_weekend --from 
 `rules_version`, `source=emulator-reconstructed`), `binding_provenance` — то же
 для привязки.
 
+Дни расписания общие для режима торгов. Контракты, появившиеся в базе после
+запуска генератора, привязываются к режиму сами: при старте сервера и сразу
+после сохранения карточки. Перезапускать генератор ради них не нужно.
+
 Подробный порядок и правила расхождений описаны в
 [проекте интеграции](docs/market-data-export-integration.md).
 
