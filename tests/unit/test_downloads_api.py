@@ -160,6 +160,9 @@ def test_base_asset_resolves_future_series_code_and_basic_asset(tmp_path):
             }
         )
         assert selection["summary"]["items_total"] == 2
+        # Короткое имя контракта, как у робота, — рядом с тикером.
+        assert [item["short_name"] for item in selection["items"]] == ["NG-3.25", "NG-4.25"]
+        assert [item["ticker"] for item in selection["items"]] == ["NGH5", "NGJ5"]
 
 
 def test_plan_window_ignores_epoch_candle_dates(tmp_path):

@@ -20,7 +20,7 @@ from src.history.jobs import (
     STATUS_RUNNING,
     DownloadJobStore,
 )
-from src.history.readiness import check_readiness, families_of, log_readiness
+from src.history.readiness import check_readiness, families_of, log_readiness, short_name
 from src.models import Instrument
 from src.storage.candle_repository import CandleRepository
 from src.storage.instrument_repository import InstrumentRepository
@@ -735,6 +735,9 @@ class DownloadService:
             selection_item = {
                 "instrument_type": instrument.instrument_type,
                 "ticker": instrument.ticker,
+                "short_name": (
+                    short_name(instrument) if instrument.instrument_type == "future" else None
+                ),
                 "interval": item["interval"],
                 "window": item["window"],
                 "availability": {

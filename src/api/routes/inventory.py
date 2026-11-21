@@ -20,6 +20,11 @@ def _app_deps(request: Request) -> ApiDeps:
     return request.app.state.deps
 
 
+def _now() -> datetime:
+    """Момент сводки, наивный UTC с точностью до секунды."""
+    return datetime.now(UTC).replace(tzinfo=None, microsecond=0)
+
+
 @router.get(
     "/inventory",
     summary="Сводка хранилища",
@@ -45,7 +50,7 @@ def get_inventory(
     if deps.read_snapshots is None:
         raise RuntimeError("ReadSnapshotStore не настроен.")
     token, view = deps.read_snapshots.get(None)
-    now = datetime.now(UTC).replace(tzinfo=None, microsecond=0)
+    now = _now()
     instruments = [item for group in view.catalogue.values() for item in group]
     rows = build_inventory(
         deps.candles.connection, instruments, interval,

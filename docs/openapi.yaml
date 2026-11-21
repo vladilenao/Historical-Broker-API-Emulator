@@ -68,6 +68,8 @@ tags:
     description: Корневой ресурс со ссылками на коллекции.
   - name: tinkoff-compatibility
     description: Неизменяемые UID-маршруты, совместимые с используемым Tinkoff API.
+  - name: history
+    description: Сводка локального хранилища — что скачано, с какой по какую дату и где пропуски. Read-only, без обращения к Tinkoff.
   - name: data-quality
     description: Офлайн-отчёт качества истории на снимке; паузы не являются доказанными потерями данных.
 
@@ -222,6 +224,7 @@ paths:
                   selection: {href: /api/v1/history/downloads/selection, method: POST}
                   downloads: {href: /api/v1/history/downloads}
                   data_quality: {href: /api/v1/history/data-quality/report, method: POST}
+                  inventory: {href: /api/v1/history/inventory}
 
   /api/v1/instruments/{instrument_type}/{ticker}/candles:
     get:
@@ -767,6 +770,119 @@ paths:
         "503":
           $ref: "#/components/responses/InstrumentReadMetadataPending"
 
+  /api/v1/history/inventory:
+    get:
+      tags: [history]
+      summary: Сводка хранилища
+      description: |
+        Что лежит в локальной базе: семейства фьючерсов (по коду серии) и акции,
+        первая и последняя свеча интервала, отставание от текущего момента,
+        пропуски контрактной цепочки и момент, с которого история пригодна для
+        прогона робота. Только чтение локальной базы, без обращения к Tinkoff;
+        строки свечей не считаются — границы берутся по индексу.
+
+        * `code` фьючерса — код серии (`NG`, `Si`): то же значение принимает
+          `target.base_asset` загрузки. `name` — базовый актив карточки
+          (`basic_asset`). У акции `code` — тикер.
+        * `lag_days` — целые календарные сутки от `last_candle` до `as_of`.
+        * `gaps` — участки цепочки, где у основного на тот момент контракта нет
+          свечей интервала (рубеж смены — за 2 суток до конца обращения, как у
+          робота). Границы уточняются по соседним контрактам: `from` — последняя
+          свеча, заходящая в пропуск слева (или рубеж смены), `to` — первая
+          свеча контракта, который продолжается после пропуска. Ищутся только
+          между первой и последней свечой цепочки, короче 7 суток не считаются;
+          отставание после последней свечи показывает `lag_days`. Дыры внутри
+          одного контракта или акции здесь не ищутся (см. data-quality).
+        * `usable_from` — с какого момента у семейства есть основной контракт и
+          его минутные свечи; то же значение печатает `historical-broker verify`.
+          Не зависит от `interval`. У акций и у серий, которые робот не
+          строит цепочкой, — `null`.
+        * `status` контракта: `full` — свечи покрывают обращение от первой
+          доступной у поставщика свечи до min(конец обращения, `as_of`) с допуском
+          7 суток на края (край, за который загрузка уже завершена, тоже
+          считается покрытым); `partial` — свечи есть, но не на всём обращении;
+          `none` — свечей интервала нет. `is_current` — основной контракт
+          цепочки в момент `as_of`.
+      operationId: getHistoryInventory
+      x-status: implemented
+      parameters:
+        - name: interval
+          in: query
+          required: false
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/Interval"
+            default: 1m
+          description: Интервал свечей, по которому строится сводка.
+        - name: instrument_type
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/DownloadInstrumentType"
+          description: Только фьючерсы или только акции; по умолчанию — оба типа.
+      responses:
+        "200":
+          description: Сводка хранилища.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HistoryInventory"
+              example:
+                interval: 1m
+                as_of: "2026-11-21T12:00:00+00:00"
+                snapshot: rs_q3Vb2Nf8kX1pLm0Ztc7aRw2e
+                instruments:
+                  - code: NG
+                    instrument_type: future
+                    name: Газ (США)
+                    contracts_total: 70
+                    contracts_with_candles: 52
+                    first_candle: "2021-01-25T07:24:00+00:00"
+                    last_candle: "2026-10-01T20:49:00+00:00"
+                    lag_days: 50
+                    gaps:
+                      - from: "2025-09-26T08:04:00+00:00"
+                        to: "2026-09-02T03:59:00+00:00"
+                    usable_from: "2021-06-28T04:00:00+00:00"
+                    contracts:
+                      - ticker: NGV6
+                        short_name: NG-10.26
+                        first_trade_date: "2026-03-19T07:00:00+00:00"
+                        expiration_date: "2026-10-29T00:00:00+00:00"
+                        first_candle: "2026-09-02T03:59:00+00:00"
+                        last_candle: "2026-10-01T20:49:00+00:00"
+                        status: partial
+                        is_current: false
+                      - ticker: NGX6
+                        short_name: NG-11.26
+                        first_trade_date: "2026-04-20T07:00:00+00:00"
+                        expiration_date: "2026-11-26T00:00:00+00:00"
+                        first_candle: null
+                        last_candle: null
+                        status: none
+                        is_current: true
+                  - code: SBER
+                    instrument_type: share
+                    name: Сбербанк
+                    contracts_total: null
+                    contracts_with_candles: null
+                    first_candle: "2022-01-03T03:59:00+00:00"
+                    last_candle: "2026-09-27T20:49:00+00:00"
+                    lag_days: 54
+                    gaps: []
+                    usable_from: null
+                    contracts: []
+                _links:
+                  self: {href: "/api/v1/history/inventory?interval=1m"}
+        "400":
+          description: Неподдерживаемый интервал или тип инструмента.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: {code: INVALID_INTERVAL, message: "Неподдерживаемый таймфрейм '2h'. Доступные: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w, 1M"}
+
   /api/v1/history/downloads/selection:
     post:
       tags: [downloads]
@@ -823,6 +939,7 @@ paths:
                     items:
                       - instrument_type: share
                         ticker: SBER
+                        short_name: null
                         interval: 1d
                         window: {from: "2025-01-01 00:00:00", to: "2025-12-31 23:59:59"}
                         availability: {status: available, available_window: {from: "2025-01-01 00:00:00", to: "2025-12-31 23:59:59"}}
@@ -842,6 +959,7 @@ paths:
                     items:
                       - instrument_type: future
                         ticker: NG-1.26
+                        short_name: NG-1.26
                         interval: 1d
                         window: {from: "2025-11-05 00:00:00", to: "2025-12-23 18:45:00"}
                         availability: {status: available, available_window: {from: "2025-11-05 00:00:00", to: "2025-12-23 18:45:00"}}
@@ -2112,6 +2230,127 @@ components:
           additionalProperties:
             $ref: "#/components/schemas/Link"
 
+    ContractShortName:
+      type: string
+      nullable: true
+      description: Короткое имя контракта, как его называет робот (`NG-11.26`) — первое слово `name` карточки. У акций `null`.
+      example: NG-11.26
+
+    InventoryMoment:
+      type: string
+      format: date-time
+      nullable: true
+      description: Момент в ISO 8601 со смещением `+00:00`; `null` — значения нет.
+      example: "2026-10-01T20:49:00+00:00"
+
+    HistoryInventory:
+      type: object
+      additionalProperties: false
+      required: [interval, as_of, snapshot, instruments, _links]
+      properties:
+        interval:
+          $ref: "#/components/schemas/Interval"
+        as_of:
+          type: string
+          format: date-time
+          description: Момент построения сводки (UTC, `+00:00`); от него считаются `lag_days` и `is_current`.
+        snapshot:
+          $ref: "#/components/schemas/ReadSnapshotToken"
+        instruments:
+          type: array
+          description: Семейства фьючерсов по коду серии, затем акции по тикеру.
+          items:
+            $ref: "#/components/schemas/InventoryInstrument"
+        _links:
+          type: object
+          required: [self]
+          additionalProperties:
+            $ref: "#/components/schemas/Link"
+
+    InventoryInstrument:
+      type: object
+      additionalProperties: false
+      required: [code, instrument_type, name, contracts_total, contracts_with_candles, first_candle, last_candle, lag_days, gaps, usable_from, contracts]
+      properties:
+        code:
+          type: string
+          description: Код серии фьючерса (значение для `target.base_asset` загрузки) или тикер акции.
+        instrument_type:
+          $ref: "#/components/schemas/DownloadInstrumentType"
+        name:
+          type: string
+          nullable: true
+          description: Базовый актив серии (`basic_asset`) или название акции.
+        contracts_total:
+          type: integer
+          nullable: true
+          minimum: 0
+          description: Контрактов серии в каталоге; у акции `null`.
+        contracts_with_candles:
+          type: integer
+          nullable: true
+          minimum: 0
+          description: Контрактов, у которых есть хотя бы одна свеча интервала; у акции `null`.
+        first_candle:
+          $ref: "#/components/schemas/InventoryMoment"
+        last_candle:
+          $ref: "#/components/schemas/InventoryMoment"
+        lag_days:
+          type: integer
+          nullable: true
+          minimum: 0
+          description: Целые сутки от `last_candle` до `as_of`; `null`, если свечей нет.
+        gaps:
+          type: array
+          description: Пропуски контрактной цепочки; у акции всегда пусто.
+          items:
+            $ref: "#/components/schemas/InventoryGap"
+        usable_from:
+          $ref: "#/components/schemas/InventoryMoment"
+        contracts:
+          type: array
+          description: Контракты серии в порядке экспирации; у акции пусто.
+          items:
+            $ref: "#/components/schemas/InventoryContract"
+
+    InventoryGap:
+      type: object
+      additionalProperties: false
+      required: [from, to]
+      properties:
+        from:
+          type: string
+          format: date-time
+          description: Последняя свеча перед пропуском или рубеж смены контракта.
+        to:
+          type: string
+          format: date-time
+          description: Первая свеча после пропуска или рубеж смены контракта.
+
+    InventoryContract:
+      type: object
+      additionalProperties: false
+      required: [ticker, short_name, first_trade_date, expiration_date, first_candle, last_candle, status, is_current]
+      properties:
+        ticker: {type: string}
+        short_name:
+          $ref: "#/components/schemas/ContractShortName"
+        first_trade_date:
+          $ref: "#/components/schemas/InventoryMoment"
+        expiration_date:
+          $ref: "#/components/schemas/InventoryMoment"
+        first_candle:
+          $ref: "#/components/schemas/InventoryMoment"
+        last_candle:
+          $ref: "#/components/schemas/InventoryMoment"
+        status:
+          type: string
+          enum: [full, partial, none]
+          description: Покрытие обращения свечами интервала.
+        is_current:
+          type: boolean
+          description: Основной контракт цепочки в момент `as_of`.
+
     DownloadSelectionItem:
       type: object
       additionalProperties: false
@@ -2120,6 +2359,8 @@ components:
         instrument_type:
           $ref: "#/components/schemas/DownloadInstrumentType"
         ticker: {type: string}
+        short_name:
+          $ref: "#/components/schemas/ContractShortName"
         interval:
           $ref: "#/components/schemas/Interval"
         window:
