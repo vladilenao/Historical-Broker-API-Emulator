@@ -242,6 +242,18 @@ def default_rules_path(exchange: str) -> Path:
     return installation_dir() / "config" / "schedule_rules" / name
 
 
+def installed_rules_paths() -> list[Path]:
+    """Файлы правил всех режимов; пользовательский файл главнее поставляемого."""
+    exchanges = {
+        path.stem.lower()
+        for folder in (installation_dir() / "config" / "schedule_rules",
+                       config_dir() / "schedule_rules")
+        if folder.is_dir()
+        for path in folder.glob("*.toml")
+    }
+    return [default_rules_path(exchange) for exchange in sorted(exchanges)]
+
+
 def _require(table: dict[str, Any], key: str, kind: type, where: str) -> Any:
     value = table.get(key)
     if not isinstance(value, kind) or (isinstance(value, str) and not value.strip()):

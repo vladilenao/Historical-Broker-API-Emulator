@@ -120,3 +120,21 @@ class TestPersistence:
         assert len(rows) == 1
         assert rows[0] == make_candle()
         conn2.close()
+
+
+class TestBounds:
+    def test_bounds_are_first_and_last_candle_in_half_open_range(self, tmp_path, make_candle):
+        repo = _repo(tmp_path)
+        repo.insert_candles([make_candle(hour=hour) for hour in (1, 3, 5)])
+        repo.insert_candles([make_candle(interval="5m", hour=0)])
+        assert repo.bounds("uid-1", "1h") == (datetime(2024, 1, 1, 1), datetime(2024, 1, 1, 5))
+        assert repo.bounds(
+            "uid-1", "1h", datetime(2024, 1, 1, 2), datetime(2024, 1, 1, 5)
+        ) == (datetime(2024, 1, 1, 3), datetime(2024, 1, 1, 3))
+
+    def test_bounds_without_candles_are_empty(self, tmp_path, make_candle):
+        repo = _repo(tmp_path)
+        repo.insert_candles([make_candle(hour=1)])
+        assert repo.bounds("uid-1", "1d") == (None, None)
+        assert repo.bounds("uid-1", "1h", before=datetime(2024, 1, 1, 1)) == (None, None)
+        assert repo.bounds("missing", "1h") == (None, None)

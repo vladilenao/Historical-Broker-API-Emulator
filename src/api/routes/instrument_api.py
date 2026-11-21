@@ -272,6 +272,7 @@ def root() -> dict[str, object]:
             "selection": {"href": "/api/v1/history/downloads/selection", "method": "POST"},
             "downloads": {"href": "/api/v1/history/downloads"},
             "data_quality": {"href": "/api/v1/history/data-quality/report", "method": "POST"},
+            "inventory": {"href": "/api/v1/history/inventory"},
         }
     }
 

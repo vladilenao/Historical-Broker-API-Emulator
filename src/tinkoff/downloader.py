@@ -82,10 +82,14 @@ class TinkoffHistoricalDownloader:
         token: str,
         candles: CandleRepository,
         instruments: InstrumentRepository,
+        on_instruments_saved: Callable[[list[str]], None] | None = None,
     ) -> None:
         self._token = token
         self._candles = candles
         self._instruments = instruments
+        # Вызывается с UID сохранённых карточек: так новые контракты сразу
+        # привязываются к режиму торгов (src/schedules/autobind.py).
+        self._on_instruments_saved = on_instruments_saved
 
     # ── синхронизация инструментов ───────────────────────────────────────────
     def sync_instrument(self, ticker: str, instrument_type: str = "share") -> Instrument:
@@ -95,13 +99,13 @@ class TinkoffHistoricalDownloader:
                 instrument = resolve_instrument(client, ticker, instrument_type)
         except Exception as exc:
             raise wrap_client_error(exc, f"инструмент '{ticker}' ({instrument_type})") from exc
-        self._instruments.upsert(instrument)
+        self._save([instrument])
         return instrument
 
     def sync_catalogue(self, instrument_type: str) -> int:
         """Синхронизирует весь каталог одного типа инструментов (shares/futures/etfs/currencies)."""
         records = self._fetch_catalogue(instrument_type)
-        count = self._instruments.upsert_many(records)
+        count = self._save(records)
         log.info("Синхронизировано %d инструментов типа '%s'", count, instrument_type)
         return count
 
@@ -123,8 +127,14 @@ class TinkoffHistoricalDownloader:
                 (derive_base_code(record.name, "future") or "").casefold(),
             }
         ]
-        count = self._instruments.upsert_many(records)
+        count = self._save(records)
         log.info("Синхронизировано %d фьючерсов серии '%s'", count, base_asset)
+        return count
+
+    def _save(self, records: list[Instrument]) -> int:
+        count = self._instruments.upsert_many(records)
+        if self._on_instruments_saved is not None:
+            self._on_instruments_saved([record.instrument_id for record in records])
         return count
 
     def _fetch_catalogue(self, instrument_type: str) -> list[Instrument]:
@@ -148,7 +158,7 @@ class TinkoffHistoricalDownloader:
                 instrument = instrument_by_uid(client, uid)
         except Exception as exc:
             raise wrap_client_error(exc, f"инструмент UID {uid}") from exc
-        self._instruments.upsert(instrument)
+        self._save([instrument])
         return instrument
 
     def resolve_local(

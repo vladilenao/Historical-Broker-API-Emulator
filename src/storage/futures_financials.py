@@ -58,6 +58,48 @@ FAMILY_FINANCIALS: dict[str, dict[str, Any]] = {
             "ГО -- якорь BRZ5 (приближение)"
         ),
     },
+    # Для GOLD, Si, RTS и ED якорь тоже погасший Z5 — последний контракт 2025
+    # года с заполненными в кэше значениями, ближайший к истории.
+    "GOLD": {
+        "min_price_increment": 0.1,
+        "min_price_increment_amount": 8.00301,
+        "initial_margin_on_buy": 19904.34,
+        "initial_margin_on_sell": 19867.52,
+        "source": (
+            "seed:spec GOLD (MOEX: шаг 0.1, стоимость шага 8.00301 RUB); "
+            "ГО -- якорь GDZ5 (приближение)"
+        ),
+    },
+    "Si": {
+        "min_price_increment": 1.0,
+        "min_price_increment_amount": 1.0,
+        "initial_margin_on_buy": 12057.11,
+        "initial_margin_on_sell": 12057.11,
+        "source": (
+            "seed:spec Si (MOEX: шаг 1, стоимость шага 1 RUB); "
+            "ГО -- якорь SiZ5 (приближение)"
+        ),
+    },
+    "RTS": {
+        "min_price_increment": 10.0,
+        "min_price_increment_amount": 16.07614,
+        "initial_margin_on_buy": 26023.84,
+        "initial_margin_on_sell": 26023.84,
+        "source": (
+            "seed:spec RTS (MOEX: шаг 10, стоимость шага 16.07614 RUB); "
+            "ГО -- якорь RIZ5 (приближение)"
+        ),
+    },
+    "ED": {
+        "min_price_increment": 0.0001,
+        "min_price_increment_amount": 8.03807,
+        "initial_margin_on_buy": 5406.23,
+        "initial_margin_on_sell": 5406.23,
+        "source": (
+            "seed:spec ED (MOEX: шаг 0.0001, стоимость шага 8.03807 RUB); "
+            "ГО -- якорь EDZ5 (приближение)"
+        ),
+    },
 }
 
 

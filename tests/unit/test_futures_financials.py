@@ -153,6 +153,29 @@ class TestApplyFamilyFinancials:
         assert got.initial_margin_on_sell == br["initial_margin_on_sell"]
         assert got.fin_source == br["source"]
 
+    def test_default_table_seeds_gold_si_rts_ed(self, tmp_path):
+        conn = _conn(tmp_path)
+        repo = InstrumentRepository(conn)
+        contracts = {
+            "GOLD": ("uid-gdh5", "GDH5", "GOLD-3.25 Золото"),
+            "Si": ("uid-sih5", "SiH5", "Si-3.25 Курс доллар - рубль"),
+            "RTS": ("uid-rih5", "RIH5", "RTS-3.25 Индекс РТС"),
+            "ED": ("uid-edh5", "EDH5", "ED-3.25 Курс евро - доллар"),
+        }
+        for uid, ticker, name in contracts.values():
+            repo.upsert(
+                Instrument(instrument_id=uid, ticker=ticker, instrument_type="future", name=name)
+            )
+        assert apply_family_financials(conn) == len(contracts)
+        for family, (uid, _, _) in contracts.items():
+            got = repo.get(uid)
+            seed = FAMILY_FINANCIALS[family]
+            assert got.min_price_increment == seed["min_price_increment"]
+            assert got.min_price_increment_amount == seed["min_price_increment_amount"]
+            assert got.initial_margin_on_buy == seed["initial_margin_on_buy"]
+            assert got.initial_margin_on_sell == seed["initial_margin_on_sell"]
+            assert got.fin_source == seed["source"]
+
 
 class TestSeedOnRuntimeStartup:
     def test_build_runtime_backfills_historical_futures(self, tmp_path, monkeypatch):

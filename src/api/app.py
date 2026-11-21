@@ -21,6 +21,7 @@ from src.api.routes import (
     health,
     instrument_api,
     instruments,
+    inventory,
     market_import,
     trading_schedules,
 )
@@ -60,6 +61,7 @@ def create_app(deps: ApiDeps) -> FastAPI:
     app.include_router(instruments.router)
     app.include_router(instrument_api.router)
     app.include_router(downloads.router)
+    app.include_router(inventory.router)
     app.include_router(market_import.router)
     app.include_router(trading_schedules.router)
     # docs/openapi.yaml is the reviewed public contract and backs /openapi.json and /docs.

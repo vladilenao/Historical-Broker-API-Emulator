@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from src.config import (
 from src.history.downloads import DownloadService
 from src.history.jobs import DownloadJobStore
 from src.market_import.service import ImportSettings, MarketImportService
+from src.schedules.autobind import ScheduleAutoBinder, load_installed_rules
 from src.storage.candle_repository import CandleRepository
 from src.storage.database import connect, initialize, reset_database
 from src.storage.futures_financials import apply_family_financials
@@ -47,6 +49,26 @@ class Runtime:
     app: object
 
 
+def _autobind(binder: ScheduleAutoBinder, conn) -> Callable[[list[str]], None]:
+    """Привязка сохранённых карточек к режиму торгов на соединении загрузчика."""
+
+    def bind(instrument_ids: list[str]) -> None:
+        try:
+            binder.bind(conn, instrument_ids)
+        except Exception:
+            log.exception("Автопривязка к режиму торгов не выполнена")
+
+    return bind
+
+
+def prepare_catalog(conn) -> ScheduleAutoBinder:
+    """То, что сервер делает с каталогом при старте: seed-поля и автопривязка."""
+    apply_family_financials(conn)
+    binder = ScheduleAutoBinder(load_installed_rules())
+    binder.bind(conn)
+    return binder
+
+
 def build_runtime(
     db_path: str | Path | None = None,
     token: str | None = None,
@@ -68,7 +90,7 @@ def build_runtime(
     conn = connect(path)
     initialize(conn, path)
     log.info("База данных инициализирована: %s", path)
-    apply_family_financials(conn)
+    binder = prepare_catalog(conn)
 
     candles = CandleRepository(conn)
     instruments = InstrumentRepository(conn)
@@ -80,6 +102,7 @@ def build_runtime(
             token=resolved_token,
             candles=candles,
             instruments=instruments,
+            on_instruments_saved=_autobind(binder, conn),
         )
         jobs = DownloadJobStore(conn, downloader, max_workers=max_download_workers)
     else:
@@ -103,6 +126,7 @@ def build_runtime(
             token=resolved_token,
             candles=CandleRepository(card_conn),
             instruments=InstrumentRepository(card_conn),
+            on_instruments_saved=_autobind(binder, card_conn),
         )
         if card_conn is not None
         else None
