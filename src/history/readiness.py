@@ -196,7 +196,7 @@ def check_readiness(
         if key not in ROBOT_FAMILIES:
             skipped.add(code)
             continue
-        if _standard(instrument):
+        if is_chain_contract(instrument):
             by_family.setdefault(code, []).append(instrument)
     result = tuple(
         _check_family(code, cards, context)
@@ -244,7 +244,7 @@ class _Context:
 
 
 @dataclass(frozen=True)
-class _Card:
+class ChainCard:
     name: str
     uid: str
     class_code: str | None
@@ -256,20 +256,12 @@ class _Card:
 
 def _check_family(code: str, instruments, context: _Context) -> FamilyReadiness:
     issues: list[Issue] = []
-    cards: list[_Card] = []
     for instrument in instruments:
-        name = _short_name(instrument)
-        issues.extend(_card_issues(code, name, instrument))
-        deadline = _deadline(instrument.expiration_date, instrument.last_trade_date)
-        cards.append(_Card(
-            name, instrument.instrument_id, instrument.class_code,
-            instrument.first_trade_date, instrument.expiration_date, deadline,
-            None if deadline is None else deadline - timedelta(days=context.lead_days),
-        ))
-    cards.sort(key=lambda card: (card.expiration or datetime.max, card.name))
+        issues.extend(_card_issues(code, short_name(instrument), instrument))
+    cards = chain_cards(instruments, context.lead_days)
     issues.extend(_chain_issues(cards, context.lead_days))
-    segments = _segments(cards)
-    usable_from, usable_note = _usable_from(cards, segments, context)
+    segments = chain_segments(cards)
+    usable_from, usable_note = usable_history(context.conn, cards, segments, context.lead_days)
     issues.extend(_schedule_issues(cards, segments, usable_from, context))
     starts = [card.first_trade for card in cards if card.first_trade is not None]
     ends = [card.expiration for card in cards if card.expiration is not None]
@@ -284,7 +276,28 @@ def _check_family(code: str, instruments, context: _Context) -> FamilyReadiness:
     )
 
 
-def _segments(cards: list[_Card]) -> list[tuple[_Card, datetime, datetime]]:
+# --- Цепочка (общая с /api/v1/history/inventory) ------------------------------
+
+
+def chain_cards(instruments, lead_days: int = DEFAULT_LEAD_DAYS) -> list[ChainCard]:
+    """Контракты цепочки в порядке экспираций, с концом обращения и рубежом смены.
+
+    ``instruments`` — стандартные контракты одного семейства
+    (см. :func:`is_chain_contract`).
+    """
+    cards = []
+    for instrument in instruments:
+        deadline = contract_deadline(instrument.expiration_date, instrument.last_trade_date)
+        cards.append(ChainCard(
+            short_name(instrument), instrument.instrument_id, instrument.class_code,
+            instrument.first_trade_date, instrument.expiration_date, deadline,
+            None if deadline is None else deadline - timedelta(days=lead_days),
+        ))
+    cards.sort(key=lambda card: (card.expiration or datetime.max, card.name))
+    return cards
+
+
+def chain_segments(cards: list[ChainCard]) -> list[tuple[ChainCard, datetime, datetime]]:
     """Участки цепочки: контракт основной от рубежа предыдущего до своего."""
     result = []
     previous_cutoff: datetime | None = None
@@ -299,8 +312,10 @@ def _segments(cards: list[_Card]) -> list[tuple[_Card, datetime, datetime]]:
     return result
 
 
-def _usable_from(cards, segments, context: _Context) -> tuple[datetime | None, str | None]:
-    """Первый момент, когда есть основной контракт и его минутные свечи."""
+def usable_history(
+    conn: Connection, cards: list[ChainCard], segments, lead_days: int = DEFAULT_LEAD_DAYS,
+) -> tuple[datetime | None, str | None]:
+    """Первый момент, когда есть основной контракт и его минутные свечи, и пояснение."""
     if not segments:
         return None, "нет ни одного участка цепочки: у карточек нет дат обращения"
     first = segments[0][0]
@@ -310,7 +325,7 @@ def _usable_from(cards, segments, context: _Context) -> tuple[datetime | None, s
     if steps:
         # Предшественник самого раннего контракта погашен и в каталоге его нет.
         predecessor = first.deadline - steps[len(steps) // 2]
-        estimated = predecessor - timedelta(days=context.lead_days)
+        estimated = predecessor - timedelta(days=lead_days)
         if estimated > start:
             start = estimated
             reason = f"раньше основного контракта в каталоге нет (самый ранний — {first.name})"
@@ -319,7 +334,7 @@ def _usable_from(cards, segments, context: _Context) -> tuple[datetime | None, s
         if upper <= start:
             continue
         lower = max(lower, start)
-        row = context.conn.execute(
+        row = conn.execute(
             "SELECT MIN(ts) FROM candles WHERE instrument_id = ? AND interval = '1m' "
             "AND ts >= ? AND ts < ?",
             (card.uid, lower.strftime(_TS_FORMAT), upper.strftime(_TS_FORMAT)),
@@ -364,7 +379,7 @@ def _card_issues(code: str, name: str, instrument) -> list[Issue]:
     return issues
 
 
-def _chain_issues(cards: list[_Card], lead_days: int) -> list[Issue]:
+def _chain_issues(cards: list[ChainCard], lead_days: int) -> list[Issue]:
     issues: list[Issue] = []
     seen: dict[datetime, str] = {}
     for card in cards:
@@ -411,7 +426,7 @@ def _schedule_issues(cards, segments, usable_from, context: _Context) -> list[Is
             ))
     if usable_from is None:
         return issues
-    windows: dict[str, list[tuple[_Card, date, date]]] = {}
+    windows: dict[str, list[tuple[ChainCard, date, date]]] = {}
     yesterday = _exchange_date(context.now) - timedelta(days=1)
     for card, lower, upper in segments:
         binding = context.schedules.binding(card.uid, context.generation)
@@ -447,7 +462,7 @@ def _schedule_issues(cards, segments, usable_from, context: _Context) -> list[Is
     return issues
 
 
-def _binding_hint(card: _Card, context: _Context) -> str:
+def _binding_hint(card: ChainCard, context: _Context) -> str:
     exchanges = [rules.exchange for rules in context.rules.values()
                  if rules.binds(card.class_code, "future")]
     if not exchanges:
@@ -478,17 +493,18 @@ def _days_hint(exchange: str, days: list[date], rules: ScheduleRules | None) -> 
 # --- Вспомогательное --------------------------------------------------------
 
 
-def _short_name(instrument) -> str:
+def short_name(instrument) -> str:
     """Имя контракта, как его называет робот: ``GOLD-3.25``."""
     return (instrument.name or "").split()[0] if instrument.name else instrument.ticker
 
 
-def _standard(instrument) -> bool:
+def is_chain_contract(instrument) -> bool:
+    """Стандартный контракт серии: робот строит цепочку только из них."""
     lower = (instrument.name or "").lower()
     return instrument.class_code == "SPBFUT" and not any(word in lower for word in _NOT_STANDARD)
 
 
-def _deadline(expiration: datetime | None, last_trade: datetime | None) -> datetime | None:
+def contract_deadline(expiration: datetime | None, last_trade: datetime | None) -> datetime | None:
     """Конец обращения по правилу ``contract_deadline`` робота."""
     if expiration is None:
         return None

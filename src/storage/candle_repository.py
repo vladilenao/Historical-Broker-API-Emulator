@@ -319,6 +319,37 @@ class CandleRepository:
             count=count,
         )
 
+    def bounds(
+        self,
+        instrument_id: str,
+        interval: str,
+        from_: datetime | None = None,
+        before: datetime | None = None,
+    ) -> tuple[datetime | None, datetime | None]:
+        """Первая и последняя свеча в ``[from_, before)`` без подсчёта строк.
+
+        ``MIN`` и ``MAX`` — отдельные подзапросы: SQLite берёт каждый из них
+        одним шагом по индексу ``(instrument_id, interval, ts)``, а общий
+        ``SELECT MIN, MAX`` прошёл бы весь диапазон. На базе в гигабайты это
+        разница между миллисекундами и секундами на инструмент.
+        """
+        where = "instrument_id = ? AND interval = ?"
+        params: list[object] = [instrument_id, interval]
+        if from_ is not None:
+            where += " AND ts >= ?"
+            params.append(_normalize_ts(from_))
+        if before is not None:
+            where += " AND ts < ?"
+            params.append(_normalize_ts(before))
+        row = self._conn.execute(
+            f"SELECT (SELECT MIN(ts) FROM candles WHERE {where}) AS lo, "
+            f"(SELECT MAX(ts) FROM candles WHERE {where}) AS hi",
+            params + params,
+        ).fetchone()
+        if row["lo"] is None:
+            return None, None
+        return parse_ts(row["lo"]), parse_ts(row["hi"])
+
     @staticmethod
     def _candle(row) -> Candle:
         return Candle(
