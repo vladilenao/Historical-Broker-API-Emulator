@@ -9,6 +9,7 @@ from sqlite3 import Connection
 from src.models import Instrument, derive_base_code
 from src.storage.candle_repository import TS_FORMAT, parse_ts
 from src.storage.database import DatabaseError
+from src.storage.futures_financials import FAMILY_FINANCIALS, apply_family_financials
 
 # Страницы каталога: по умолчанию отдаём всё, но потолок защищает от
 # случайного запроса без фильтров на очень большом каталоге.
@@ -55,10 +56,18 @@ _UPSERT = f"""
         class_code = excluded.class_code,
         currency = excluded.currency,
         lot = excluded.lot,
-        min_price_increment = excluded.min_price_increment,
-        min_price_increment_amount = excluded.min_price_increment_amount,
-        initial_margin_on_buy = excluded.initial_margin_on_buy,
-        initial_margin_on_sell = excluded.initial_margin_on_sell,
+        min_price_increment = COALESCE(
+            excluded.min_price_increment, instruments.min_price_increment
+        ),
+        min_price_increment_amount = COALESCE(
+            excluded.min_price_increment_amount, instruments.min_price_increment_amount
+        ),
+        initial_margin_on_buy = COALESCE(
+            excluded.initial_margin_on_buy, instruments.initial_margin_on_buy
+        ),
+        initial_margin_on_sell = COALESCE(
+            excluded.initial_margin_on_sell, instruments.initial_margin_on_sell
+        ),
         expiration_date = excluded.expiration_date,
         basic_asset = excluded.basic_asset,
         basic_asset_size = excluded.basic_asset_size,
@@ -67,9 +76,21 @@ _UPSERT = f"""
         last_trade_date = excluded.last_trade_date,
         first_1min_candle_date = excluded.first_1min_candle_date,
         first_1day_candle_date = excluded.first_1day_candle_date,
-        fin_source = excluded.fin_source,
+        fin_source = CASE
+            WHEN excluded.min_price_increment IS NOT NULL
+             AND excluded.min_price_increment_amount IS NOT NULL
+             AND excluded.initial_margin_on_buy IS NOT NULL
+             AND excluded.initial_margin_on_sell IS NOT NULL
+            THEN excluded.fin_source
+            ELSE COALESCE(excluded.fin_source, instruments.fin_source)
+        END,
         updated_at = excluded.updated_at
 """
+# Финансовые поля: погасшие контракты Tinkoff отдаёт с нулями (у нас NULL), и
+# повторное получение карточки не должно стирать то, что уже известно — значение
+# с прежней карточки или seed из ``futures_financials``. Поэтому NULL из
+# источника не перезаписывает сохранённое, а пометка seed-источника остаётся,
+# пока источник не отдаст все четыре значения сам.
 
 
 def _now() -> str:
@@ -112,16 +133,24 @@ def _expiration_value(raw: object | None) -> object | None:
 class InstrumentRepository:
     """Хранилище метаданных инструментов на SQLite."""
 
-    def __init__(self, conn: Connection) -> None:
+    def __init__(self, conn: Connection, *, seed_financials: bool = False) -> None:
+        """``seed_financials`` — сразу после записи фьючерсов дозаполнять их
+        пустые финансовые поля из seed-таблицы семейства. Так работает сервер:
+        иначе новая карточка погасшего контракта, полученная при загрузке или
+        предпросмотре, оставалась бы без стоимости шага и ГО до перезапуска, и
+        робот отказывал бы прогону цепочки."""
         self._conn = conn
+        self._seed_financials = seed_financials
 
     def upsert(self, instrument: Instrument) -> None:
         """Вставляет или заменяет запись метаданных инструмента."""
+        row = self._row(instrument)
         try:
             with self._conn:
-                self._conn.execute(_UPSERT, self._row(instrument))
+                self._conn.execute(_UPSERT, row)
         except Exception as exc:
             raise DatabaseError(f"Не удалось сохранить инструмент: {exc}") from exc
+        self._reseed([row])
 
     def upsert_many(self, instruments: Iterable[Instrument]) -> int:
         """Пакетная вставка/замена; возвращает число обработанных записей."""
@@ -131,9 +160,21 @@ class InstrumentRepository:
         try:
             with self._conn:
                 cur = self._conn.executemany(_UPSERT, rows)
-            return cur.rowcount if cur.rowcount > 0 else len(rows)
+            count = cur.rowcount if cur.rowcount > 0 else len(rows)
         except Exception as exc:
             raise DatabaseError(f"Не удалось сохранить инструменты: {exc}") from exc
+        self._reseed(rows)
+        return count
+
+    def _reseed(self, rows: list[tuple]) -> None:
+        if not self._seed_financials:
+            return
+        type_at = _COLUMNS.index("instrument_type")
+        code_at = _COLUMNS.index("base_code")
+        codes = {row[code_at] for row in rows if row[type_at] == "future" and row[code_at]}
+        families = {code: FAMILY_FINANCIALS[code] for code in codes if code in FAMILY_FINANCIALS}
+        if families:
+            apply_family_financials(self._conn, families)
 
     @staticmethod
     def _row(i: Instrument) -> tuple:

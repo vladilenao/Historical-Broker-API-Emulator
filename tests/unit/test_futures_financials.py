@@ -183,7 +183,8 @@ class TestSeedOnRuntimeStartup:
         path = tmp_path / "rt.db"
 
         first = build_runtime(path)
-        first.instruments.upsert(_ng_future())
+        # Старая строка без seed: записана в обход рабочего репозитория сервера.
+        InstrumentRepository(first.connection).upsert(_ng_future())
         assert first.instruments.get("uid-ngf5").min_price_increment_amount is None
         first.connection.close()
 
@@ -193,3 +194,71 @@ class TestSeedOnRuntimeStartup:
         assert got.min_price_increment_amount == ng["min_price_increment_amount"]
         assert got.fin_source == ng["source"]
         second.connection.close()
+
+
+class TestCardRefreshKeepsFinancials:
+    """Повторная карточка погасшего контракта приходит с нулями (у нас NULL).
+
+    Раньше upsert записывал эти NULL поверх seed, и после предпросмотра или
+    загрузки семейства у всех погасших контрактов пропадали стоимость шага и
+    ГО — робот отказывал прогону цепочки (NG-6.26, 21.11.2026).
+    """
+
+    def test_null_from_source_does_not_erase_seed(self, tmp_path):
+        conn = _conn(tmp_path)
+        repo = InstrumentRepository(conn)
+        repo.upsert(_ng_future())
+        apply_family_financials(conn, TEST_FAMILY)
+
+        repo.upsert(_ng_future())  # та же карточка снова, финансовые поля пустые
+
+        got = repo.get("uid-ngf5")
+        assert got.min_price_increment_amount == 8.49048
+        assert got.initial_margin_on_buy == 8195.69
+        assert got.initial_margin_on_sell == 8580.55
+        assert got.fin_source == "test:seed NG"
+
+    def test_real_values_from_source_replace_seed(self, tmp_path):
+        conn = _conn(tmp_path)
+        repo = InstrumentRepository(conn)
+        repo.upsert(_ng_future())
+        apply_family_financials(conn, TEST_FAMILY)
+
+        repo.upsert(
+            Instrument(
+                instrument_id="uid-ngf5",
+                ticker="NGF5",
+                instrument_type="future",
+                name="NG-1.25 Природный газ",
+                min_price_increment=0.001,
+                min_price_increment_amount=9.1,
+                initial_margin_on_buy=9000.0,
+                initial_margin_on_sell=9100.0,
+            )
+        )
+
+        got = repo.get("uid-ngf5")
+        assert got.min_price_increment_amount == 9.1
+        assert got.initial_margin_on_buy == 9000.0
+        assert got.fin_source is None
+
+    def test_server_repository_seeds_new_card_at_once(self, tmp_path):
+        conn = _conn(tmp_path)
+        repo = InstrumentRepository(conn, seed_financials=True)
+
+        repo.upsert_many(
+            [_ng_future(), _ng_future(uid="uid-ngg5", ticker="NGG5", name="NG-2.25 Природный газ")]
+        )
+
+        ng = FAMILY_FINANCIALS["NG"]
+        for uid in ("uid-ngf5", "uid-ngg5"):
+            got = repo.get(uid)
+            assert got.min_price_increment_amount == ng["min_price_increment_amount"]
+            assert got.initial_margin_on_sell == ng["initial_margin_on_sell"]
+            assert got.fin_source == ng["source"]
+
+    def test_plain_repository_does_not_seed(self, tmp_path):
+        conn = _conn(tmp_path)
+        repo = InstrumentRepository(conn)
+        repo.upsert(_ng_future())
+        assert repo.get("uid-ngf5").min_price_increment_amount is None
