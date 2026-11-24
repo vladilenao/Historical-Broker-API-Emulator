@@ -93,7 +93,7 @@ def build_runtime(
     binder = prepare_catalog(conn)
 
     candles = CandleRepository(conn)
-    instruments = InstrumentRepository(conn)
+    instruments = InstrumentRepository(conn, seed_financials=True)
     downloader: TinkoffHistoricalDownloader | None = None
     jobs: DownloadJobStore | None = None
     resolved_token = token or TINKOFF_TOKEN
@@ -125,7 +125,7 @@ def build_runtime(
         TinkoffHistoricalDownloader(
             token=resolved_token,
             candles=CandleRepository(card_conn),
-            instruments=InstrumentRepository(card_conn),
+            instruments=InstrumentRepository(card_conn, seed_financials=True),
             on_instruments_saved=_autobind(binder, card_conn),
         )
         if card_conn is not None
